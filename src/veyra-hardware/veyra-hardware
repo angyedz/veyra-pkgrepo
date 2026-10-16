@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+echo '=== CPU ==='
+grep -m1 'model name' /proc/cpuinfo || :
+echo '=== Memory ==='
+free -h
+echo '=== PCI graphics ==='
+if command -v lspci >/dev/null; then lspci | grep -iE 'vga|3d|display' || :; else echo 'Install pciutils for PCI details'; fi
+echo '=== Graphics ==='
+if command -v glxinfo >/dev/null; then glxinfo -B; else echo 'Install mesa-utils for OpenGL details'; fi
