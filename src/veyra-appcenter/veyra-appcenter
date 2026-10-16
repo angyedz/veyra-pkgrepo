@@ -1,25 +1,142 @@
-#!/bin/sh
-set -eu
-command -v zenity >/dev/null || { echo 'Veyra AppCenter requires zenity' >&2; exit 1; }
-while :; do
- action=$(zenity --list --title='Veyra AppCenter' --column='Action' search install remove nix --height=310) || exit 0
- case "$action" in
- search)
-   query=$(zenity --entry --title='Search packages' --text='Package name or keyword:') || continue
-   [ -n "$query" ] || continue
-   result=$(apk search -v -- "$query" | head -80) || :
-   [ -n "$result" ] || result='No matches found.'
-   printf '%s\n' "$result" | zenity --text-info --title='APK search results' --width=850 --height=520
-   ;;
- install|remove)
-   name=$(zenity --entry --title='Veyra AppCenter' --text='Exact APK package name:') || continue
-   case "$name" in ''|*[!a-zA-Z0-9._+@-]*) zenity --error --text='Invalid package name'; continue ;; esac
-   zenity --question --text="Run apk $([ "$action" = install ] && echo add || echo del) for $name?" || continue
-   command -v pkexec >/dev/null || { zenity --error --text='pkexec is required for administrative actions'; continue; }
-   if [ "$action" = install ]; then pkexec apk add -- "$name"; else pkexec apk del -- "$name"; fi
-   ;;
- nix)
-   zenity --info --text='Use vpkg search NAME --from nix and vpkg install NAME --from nix in a terminal.'
-   ;;
- esac
-done
+#!/usr/bin/env python3
+"""Veyra AppCenter: Qt6 frontend for APK and optional Nix packages."""
+import re
+import shutil
+import subprocess
+import sys
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton,
+    QVBoxLayout, QWidget)
+
+VALID_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._+@-]*$")
+
+class Worker(QThread):
+    completed = pyqtSignal(int, str)
+    def __init__(self, argv):
+        super().__init__()
+        self.argv = argv
+    def run(self):
+        try:
+            p = subprocess.run(self.argv, capture_output=True, text=True,
+                               timeout=180, check=False)
+            self.completed.emit(p.returncode, (p.stdout + "\n" + p.stderr).strip())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.completed.emit(1, str(exc))
+
+class AppCenter(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Veyra AppCenter")
+        self.resize(860, 580)
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        title = QLabel("Veyra AppCenter")
+        title.setStyleSheet("font-size: 27px; font-weight: 700; margin: 12px")
+        layout.addWidget(title)
+        bar = QHBoxLayout()
+        self.source = QComboBox()
+        self.source.addItem("Alpine / Veyra (APK)", "apk")
+        if shutil.which("nix-env"):
+            self.source.addItem("Nix", "nix")
+        self.query = QLineEdit()
+        self.query.setPlaceholderText("Search packages...")
+        self.query.returnPressed.connect(self.search)
+        search = QPushButton("Search")
+        search.clicked.connect(self.search)
+        for widget in (self.source, self.query, search):
+            bar.addWidget(widget)
+        layout.addLayout(bar)
+        self.results = QListWidget()
+        layout.addWidget(self.results)
+        actions = QHBoxLayout()
+        for label, action in (("Install", "install"), ("Remove", "remove")):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _, a=action: self.change(a))
+            actions.addWidget(button)
+        layout.addLayout(actions)
+        self.status = QLabel("Ready")
+        layout.addWidget(self.status)
+        self.worker = None
+
+    def launch(self, argv, callback):
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.status.setText("Working...")
+        self.worker = Worker(argv)
+        self.worker.completed.connect(callback)
+        self.worker.start()
+
+    def search(self):
+        query = self.query.text().strip()
+        if not query or query.startswith("-"):
+            return
+        source = self.source.currentData()
+        if source == "apk":
+            argv = ["apk", "search", "-v", "--", query]
+        else:
+            argv = ["nix-env", "-qa", "--description", query]
+        self.launch(argv, self.show_results)
+
+    def show_results(self, code, output):
+        self.results.clear()
+        if code:
+            QMessageBox.warning(self, "Search failed", output[:3000])
+        else:
+            for line in output.splitlines()[:300]:
+                self.results.addItem(line)
+        self.status.setText(f"{self.results.count()} results")
+
+    def change(self, action):
+        item = self.results.currentItem()
+        if item is None:
+            return
+        source = self.source.currentData()
+        line = item.text().split()[0]
+        if source == "apk":
+            # apk search -v renders package-version followed by description.
+            # Query the exact package name separately instead of guessing from a versioned row.
+            name, ok = self.ask_name(line)
+            if not ok:
+                return
+            argv = ["pkexec", "apk", "add" if action == "install" else "del", "--", name]
+        else:
+            name = line
+            if not VALID_NAME.fullmatch(name):
+                QMessageBox.warning(self, "Invalid package", "Invalid Nix attribute name")
+                return
+            argv = ["nix-env", "-iA" if action == "install" else "-e", name]
+            if action == "install":
+                argv = ["nix-env", "-i", name]
+        if QMessageBox.question(self, "Confirm", f"{action.title()} {name}?") != QMessageBox.StandardButton.Yes:
+            return
+        if not shutil.which(argv[0]):
+            QMessageBox.warning(self, "Missing dependency", f"{argv[0]} is not installed")
+            return
+        self.launch(argv, self.operation_finished)
+
+    def ask_name(self, suggestion):
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Package name",
+                                         "Exact APK package name:", text=suggestion)
+        if not ok:
+            return "", False
+        if not VALID_NAME.fullmatch(name):
+            QMessageBox.warning(self, "Invalid package", "Enter a valid APK package name")
+            return "", False
+        return name, True
+
+    def operation_finished(self, code, output):
+        self.status.setText("Completed" if code == 0 else "Failed")
+        if code:
+            QMessageBox.warning(self, "Operation failed", output[:3000])
+        else:
+            QMessageBox.information(self, "Completed", output[:3000] or "Success")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = AppCenter()
+    window.show()
+    sys.exit(app.exec())
