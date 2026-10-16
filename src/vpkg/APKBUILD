@@ -1,0 +1,19 @@
+pkgname=vpkg
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Veyra CLI package manager for APK and Nix"
+url="https://github.com/angyedz/Veyra-Linux"
+arch="x86_64"
+license="MIT"
+depends="apk-tools"
+makedepends="go"
+options="!check"
+source=""
+builddir="$srcdir"
+build() {
+    cd "$startdir/../../distro-source/vpkg"
+    CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -ldflags="-s -w" -o "$builddir/vpkg" .
+}
+package() {
+    install -Dm755 "$builddir/vpkg" "$pkgdir/usr/bin/vpkg"
+}

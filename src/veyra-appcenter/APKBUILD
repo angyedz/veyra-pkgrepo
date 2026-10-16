@@ -1,15 +1,18 @@
 pkgname=veyra-appcenter
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=0
-pkgdesc="Veyra Linux appcenter utility"
-url="https://github.com/angyedz/Veyra-Linux"
+pkgdesc="Veyra Linux Qt Quick application manager for APK and Nix"
+url="https://github.com/angyedz/veyra-pkgrepo"
 arch="noarch"
 license="MIT"
-depends="kdialog apk-tools"
+depends="python3 py3-qt6 qt6-qtdeclarative polkit apk-tools"
 options="!check"
 source=""
 builddir="$srcdir"
+
 package() {
-    install -Dm755 "$startdir/$pkgname" "$pkgdir/usr/bin/$pkgname"
-    install -Dm644 "$startdir/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+    install -Dm755 "$startdir/veyra-appcenter" "$pkgdir/usr/bin/veyra-appcenter"
+    install -Dm644 "$startdir/backend.py" "$pkgdir/usr/share/veyra/appcenter/backend.py"
+    install -Dm644 "$startdir/main.qml" "$pkgdir/usr/share/veyra/appcenter/main.qml"
+    install -Dm644 "$startdir/veyra-appcenter.desktop" "$pkgdir/usr/share/applications/veyra-appcenter.desktop"
 }
