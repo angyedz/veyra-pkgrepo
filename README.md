@@ -18,7 +18,7 @@ keys/                  # Public APK signing keys only
 
 ## Publishing policy
 
-1. Maintain Veyra-specific application sources and APKBUILD recipes under `src/` in **this repository**. The distro repository currently retains the established signed build/publish workflow until it is migrated safely.
+1. Maintain Veyra-specific application sources and APKBUILD recipes under `src/` in **this repository**. The distro's signed build workflow checks out this repository and builds the APKs from `src/`; it does not use duplicate distro-side recipes for Veyra desktop packages. Signing secrets remain in the distro repository for now.
 2. Sign packages and their index with the stable Veyra abuild key.
 3. Stage a complete repository snapshot, then publish it to this repository.
 4. Promote tested packages to `stable`; use `testing` for prereleases.
@@ -32,6 +32,6 @@ GitHub's raw repository paths are not a guaranteed production APK mirror; GitHub
 
 ## First-party source packages
 
-The `src/` tree contains Veyra application sources and packaging recipes: AppCenter, Welcome, Settings, Update, Session, Hardware, Driver Manager, Compatibility, Repair, Themes, Meta and glenv. `vpkg` remains developed in the distro repository for now. The source tree is distinct from the signed binary repository under `stable/v1/x86_64/`.
+The `src/` tree contains Veyra application sources and packaging recipes: AppCenter, Welcome, Settings, Update, Session, Hardware, Driver Manager, Compatibility, Repair, Themes, Meta and glenv. `vpkg` remains developed in the distro repository for now. Package source edits here are validated by `.github/workflows/source-checks.yml`; to publish a signed release after source changes, manually dispatch the `Veyra native packages` workflow in the distro repository until cross-repository publication automation is configured. The source tree is distinct from the signed binary repository under `stable/v1/x86_64/`.
 
 Current graphical applications are lightweight MVPs using KDE dialogs; the full Qt/QML AppCenter and Nix graphical backend are not implemented yet. Driver Manager currently diagnoses devices rather than installing drivers automatically.
