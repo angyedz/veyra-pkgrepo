@@ -44,6 +44,16 @@ class PackageParsing(unittest.TestCase):
         self.assertEqual(data[0]["removeKey"], "0")
         self.assertEqual(data[0]["name"], "hello")
 
+    def test_curated_discover_catalog(self):
+        featured = backend.featured_packages()
+        self.assertEqual(len(featured), 14)
+        self.assertTrue(all(p["source"] == "apk" for p in featured))
+        self.assertTrue(all(p["category"] != "Games" for p in featured))
+        self.assertEqual(len(backend.featured_packages("Creative")), 3)
+        self.assertEqual(backend.featured_packages("Office")[0]["name"], "libreoffice")
+        with self.assertRaises(ValueError):
+            backend.featured_packages("Gaming")
+
     def test_validation(self):
         for invalid in ("", "-danger", "bad space", "../escape", "a;id", "a"*129):
             with self.assertRaises(ValueError):
