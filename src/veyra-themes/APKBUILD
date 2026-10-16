@@ -9,7 +9,7 @@ options="!check"
 source=""
 builddir="$srcdir"
 package() {
-  local root="$startdir/../../.."
+  local root="$startdir/../.."
   install -Dm644 "$root/branding/veyra-logo.svg" "$pkgdir/usr/share/pixmaps/veyra-logo.svg"
   install -Dm644 "$root/branding/fastfetch/logo.txt" "$pkgdir/usr/share/veyra/fastfetch/logo.txt"
   install -Dm644 "$root/branding/fastfetch/config.jsonc" "$pkgdir/etc/fastfetch/config.jsonc"
