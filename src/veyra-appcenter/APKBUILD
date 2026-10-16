@@ -1,0 +1,15 @@
+pkgname=veyra-appcenter
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Veyra Linux appcenter utility"
+url="https://github.com/angyedz/Veyra-Linux"
+arch="noarch"
+license="MIT"
+depends="kdialog apk-tools"
+options="!check"
+source=""
+builddir="$srcdir"
+package() {
+    install -Dm755 "$startdir/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 "$startdir/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+}
