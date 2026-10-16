@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Veyra Settings
+Exec=veyra-settings
+Icon=applications-system
+Terminal=false
+Categories=System;
