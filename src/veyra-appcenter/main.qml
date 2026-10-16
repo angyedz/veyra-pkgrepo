@@ -10,14 +10,24 @@ ApplicationWindow {
     minimumWidth: 720
     minimumHeight: 480
     title: "Veyra AppCenter"
-    Component.onCompleted: console.log("VEYRA_QML_READY")
+    Component.onCompleted: { console.log("VEYRA_QML_READY"); backend.featured("All") }
     color: "#10141e"
     property bool installedMode: false
 
     function currentSource() { return sourceBox.currentIndex === 0 ? "apk" : "nix" }
     function runSearch() {
         installedMode = false
-        backend.search(searchBox.text, currentSource())
+        if (searchBox.text.trim().length === 0 && currentSource() === "apk")
+            backend.featured(categoryBox.currentText)
+        else
+            backend.search(searchBox.text, currentSource())
+    }
+    function discover() {
+        installedMode = false
+        sourceBox.currentIndex = 0
+        searchBox.text = ""
+        categoryBox.currentIndex = 0
+        backend.featured("All")
     }
     function showInstalled() {
         installedMode = true
@@ -66,7 +76,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     text: "Discover"
                     highlighted: !installedMode
-                    onClicked: window.runSearch()
+                    onClicked: window.discover()
                 }
                 Button {
                     Layout.fillWidth: true
@@ -92,7 +102,7 @@ ApplicationWindow {
                     model: backend.nixAvailable ? ["Alpine / Veyra", "Nix packages"] : ["Alpine / Veyra"]
                     onActivated: {
                         if (window.installedMode) window.showInstalled()
-                        else if (searchBox.text.trim().length > 0) window.runSearch()
+                        else window.runSearch()
                     }
                 }
                 Label {
@@ -148,9 +158,35 @@ ApplicationWindow {
                 }
                 Button {
                     text: "Search"
-                    enabled: !backend.busy && searchBox.text.trim().length > 0
+                    enabled: !backend.busy
                     highlighted: true
                     onClicked: window.runSearch()
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+                Label {
+                    text: "Explore"
+                    color: "#a8b6ca"
+                    font.pixelSize: 12
+                }
+                ComboBox {
+                    id: categoryBox
+                    Layout.preferredWidth: 210
+                    enabled: !backend.busy && !installedMode && window.currentSource() === "apk"
+                    model: ["All", "Internet", "Office", "Media", "Creative", "Utilities"]
+                    onActivated: {
+                        searchBox.text = ""
+                        backend.featured(currentText)
+                    }
+                }
+                Label {
+                    text: installedMode ? "Installed packages" : "Recommended for everyday use"
+                    color: "#8e9eb7"
+                    font.pixelSize: 12
+                    Layout.fillWidth: true
+                    horizontalAlignment: Text.AlignRight
                 }
             }
             Rectangle {
@@ -200,7 +236,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             spacing: 3
                             Label {
-                                text: pkg.name
+                                text: pkg.title || pkg.name
                                 color: "#f1f5ff"
                                 font.bold: true
                                 font.pixelSize: 16
@@ -261,7 +297,7 @@ ApplicationWindow {
             anchors.fill: parent
             spacing: 14
             Label {
-                text: details.pkg.name || ""
+                text: details.pkg.title || details.pkg.name || ""
                 font.pixelSize: 24
                 font.bold: true
                 color: "#ffffff"
