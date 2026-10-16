@@ -45,4 +45,13 @@ jobs:
       - name: Check GUI dependencies exist in Alpine repositories
         run: |
           apk update
-          apk add --simulate python3 py3-qt6 qt6-qtdeclarative polkit
+          apk add --no-cache python3 py3-qt6 qt6-qtdeclarative polkit
+      - name: Launch Qt Quick frontend in headless mode
+        run: |
+          set +e
+          QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software timeout 6s python3 src/veyra-appcenter/veyra-appcenter > /tmp/veyra-qml.log 2>&1
+          result=$?
+          set -e
+          cat /tmp/veyra-qml.log
+          # A healthy GUI stays alive until timeout; QML import errors exit early.
+          test "$result" -eq 124
