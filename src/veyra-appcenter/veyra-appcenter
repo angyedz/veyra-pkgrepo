@@ -17,7 +17,7 @@ if not (ASSET_DIR / "main.qml").is_file():
     ASSET_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ASSET_DIR))
 from backend import (parse_apk_search, parse_apk_installed, parse_nix_search,
-                     parse_nix_profile, nix_cli, validate_name)
+                     parse_nix_profile, nix_cli, validate_name, featured_packages)
 
 
 class CommandThread(QThread):
@@ -101,6 +101,18 @@ class PackageController(QObject):
                 self.set_status("Invalid package data: " + str(error))
         self._worker.finished_command.connect(handle)
         self._worker.start()
+
+    @pyqtSlot(str)
+    def featured(self, category):
+        if self._busy:
+            return
+        try:
+            self._results = featured_packages(category)
+        except ValueError as error:
+            self.set_status(str(error))
+            return
+        self.changed.emit()
+        self.set_status("Popular applications from the Alpine repositories")
 
     @pyqtSlot(str, str)
     def search(self, query, source):
