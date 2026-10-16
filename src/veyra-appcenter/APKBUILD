@@ -1,11 +1,11 @@
 pkgname=veyra-appcenter
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=0
-pkgdesc="Veyra Linux appcenter utility"
-url="https://github.com/angyedz/Veyra-Linux"
+pkgdesc="Qt6 application manager for Veyra Linux"
+url="https://github.com/angyedz/veyra-pkgrepo"
 arch="noarch"
 license="MIT"
-depends="kdialog apk-tools"
+depends="python3 py3-pyqt6 polkit apk-tools"
 options="!check"
 source=""
 builddir="$srcdir"
