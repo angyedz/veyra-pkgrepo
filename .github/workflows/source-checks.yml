@@ -56,3 +56,15 @@ jobs:
           # A healthy GUI stays alive until timeout; QML import errors exit early.
           grep -q 'VEYRA_QML_READY' /tmp/veyra-qml.log
           test "$result" -eq 124 || test "$result" -eq 143
+      - name: Verify curated app names exist in pinned Alpine Stable
+        run: |
+          set -eu
+          apk update
+          python3 -c 'import sys; sys.path.insert(0, "src/veyra-appcenter"); from backend import FEATURED_APPS; print("\\n".join(x[0] for x in FEATURED_APPS))' > /tmp/veyra-featured
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            apk search -q -x "$name" | grep -Fqx "$name" || {
+              echo "Curated package missing from Alpine 3.22: $name" >&2
+              exit 1
+            }
+          done < /tmp/veyra-featured
