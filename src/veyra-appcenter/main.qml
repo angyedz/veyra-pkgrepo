@@ -10,6 +10,7 @@ ApplicationWindow {
     minimumWidth: 720
     minimumHeight: 480
     title: "Veyra AppCenter"
+    Component.onCompleted: console.log("VEYRA_QML_READY")
     color: "#10141e"
     property bool installedMode: false
 
