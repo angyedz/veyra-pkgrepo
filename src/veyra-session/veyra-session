@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+case "${1:-status}" in
+status) printf 'Session: %s\nDesktop: %s\n' "${XDG_SESSION_TYPE:-unknown}" "${XDG_CURRENT_DESKTOP:-unknown}"; ls /usr/share/xsessions /usr/share/wayland-sessions 2>/dev/null || : ;;
+diagnose) command -v glxinfo >/dev/null && glxinfo -B || echo 'Install mesa-utils for OpenGL details'; free -h; dmesg 2>/dev/null | grep -iE 'oom|gpu|drm' | tail -25 || : ;;
+*) echo 'Usage: veyra-session [status|diagnose]' >&2; exit 2 ;;
+esac
