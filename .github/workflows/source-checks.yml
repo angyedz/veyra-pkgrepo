@@ -60,7 +60,7 @@ jobs:
         run: |
           set -eu
           apk update
-          python3 -c 'import sys; sys.path.insert(0, "src/veyra-appcenter"); from backend import FEATURED_APPS; print("\\n".join(x[0] for x in FEATURED_APPS))' > /tmp/veyra-featured
+          python3 -c 'import sys; sys.path.insert(0, "src/veyra-appcenter"); from backend import FEATURED_APPS; print(*(x[0] for x in FEATURED_APPS), sep=chr(10))' > /tmp/veyra-featured
           while IFS= read -r name; do
             [ -n "$name" ] || continue
             apk search -q -x "$name" | grep -Fqx "$name" || {
