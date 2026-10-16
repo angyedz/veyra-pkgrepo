@@ -54,4 +54,5 @@ jobs:
           set -e
           cat /tmp/veyra-qml.log
           # A healthy GUI stays alive until timeout; QML import errors exit early.
-          test "$result" -eq 124
+          grep -q 'VEYRA_QML_READY' /tmp/veyra-qml.log
+          test "$result" -eq 124 || test "$result" -eq 143
