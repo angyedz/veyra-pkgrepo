@@ -4,11 +4,13 @@ on:
     paths:
       - 'src/**'
       - 'branding/**'
+      - 'tests/**'
       - '.github/workflows/source-checks.yml'
   pull_request:
     paths:
       - 'src/**'
       - 'branding/**'
+      - 'tests/**'
   workflow_dispatch:
 permissions:
   contents: read
@@ -18,10 +20,10 @@ jobs:
     container: alpine:3.22
     steps:
       - uses: actions/checkout@v4
-      - name: Validate APKBUILD and shell syntax
+      - name: Validate package recipes and script syntax
         run: |
           set -eu
-          apk add --no-cache bash
+          apk add --no-cache python3
           for recipe in src/*/APKBUILD; do
             sh -n "$recipe"
             echo "Validated $recipe"
@@ -29,8 +31,18 @@ jobs:
           for script in src/*/veyra-*; do
             [ -f "$script" ] || continue
             case "$script" in *.desktop|*/APKBUILD) continue ;; esac
-            head -n 1 "$script" | grep -q '^#!' || continue
-            sh -n "$script"
+            case "$(head -n 1 "$script")" in
+              *python*) python3 -m py_compile "$script" ;;
+              '#!'*'/sh'*|'#!'*'/bash'*) sh -n "$script" ;;
+            esac
           done
+          python3 -m py_compile src/veyra-appcenter/backend.py
+          test -s src/veyra-appcenter/main.qml
           test -s branding/veyra-logo.svg
           test -s branding/fastfetch/logo.txt
+      - name: Unit tests for package parsing and command validation
+        run: python3 -m unittest discover -s tests -v
+      - name: Check GUI dependencies exist in Alpine repositories
+        run: |
+          apk update
+          apk add --simulate python3 py3-pyqt6 qt6-qtdeclarative polkit
