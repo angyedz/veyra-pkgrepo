@@ -1,0 +1,36 @@
+name: Package source checks
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'branding/**'
+      - '.github/workflows/source-checks.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'branding/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    container: alpine:3.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate APKBUILD and shell syntax
+        run: |
+          set -eu
+          apk add --no-cache bash
+          for recipe in src/*/APKBUILD; do
+            sh -n "$recipe"
+            echo "Validated $recipe"
+          done
+          for script in src/*/veyra-*; do
+            [ -f "$script" ] || continue
+            case "$script" in *.desktop|*/APKBUILD) continue ;; esac
+            head -n 1 "$script" | grep -q '^#!' || continue
+            sh -n "$script"
+          done
+          test -s branding/veyra-logo.svg
+          test -s branding/fastfetch/logo.txt
