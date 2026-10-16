@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+printf 'Native APK: '; command -v apk || :
+printf 'Veyra package manager: '; command -v vpkg || :
+printf 'glibc compatibility: '; command -v glenv || echo 'not initialized'
+printf 'Nix: '; command -v nix || echo 'not installed'
+printf 'Wine: '; command -v wine || echo 'not installed'
+echo 'Use vpkg search <name> and vpkg install <name> --from nix for optional Nix packages.'
