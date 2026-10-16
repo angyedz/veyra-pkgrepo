@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Veyra AppCenter
+Exec=veyra-appcenter
+Icon=applications-system
+Terminal=false
+Categories=System;
