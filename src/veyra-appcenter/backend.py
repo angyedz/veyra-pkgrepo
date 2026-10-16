@@ -102,3 +102,37 @@ def parse_nix_profile(output):
 def nix_cli(*parts):
     # Explicit opt-in to the Nix 2.x CLI; no implicit system-wide mutations.
     return ["nix", "--extra-experimental-features", "nix-command flakes", *parts]
+
+# Curated launch page: familiar end-user applications, no developer/game packages.
+# Names are validated against Alpine Stable in GitHub Actions.
+FEATURED_APPS = (
+    ("firefox", "Firefox", "Private and flexible web browser", "Internet"),
+    ("chromium", "Chromium", "Fast open-source web browser", "Internet"),
+    ("thunderbird", "Thunderbird", "Email, calendar and contacts", "Internet"),
+    ("libreoffice", "LibreOffice", "Documents, presentations and spreadsheets", "Office"),
+    ("evince", "Document Viewer", "Read PDF and document files", "Office"),
+    ("vlc", "VLC", "Video and audio player", "Media"),
+    ("mpv", "mpv", "Minimalist high-performance media player", "Media"),
+    ("audacity", "Audacity", "Record and edit audio", "Media"),
+    ("gimp", "GIMP", "Edit photos and images", "Creative"),
+    ("inkscape", "Inkscape", "Draw vector graphics", "Creative"),
+    ("krita", "Krita", "Digital drawing and painting", "Creative"),
+    ("keepassxc", "KeePassXC", "Store passwords locally and securely", "Utilities"),
+    ("filezilla", "FileZilla", "Transfer files over SFTP and FTP", "Utilities"),
+    ("transmission-gtk", "Transmission", "A simple BitTorrent client", "Utilities"),
+)
+
+
+def featured_packages(category="All"):
+    if category not in ("All", "Internet", "Office", "Media", "Creative", "Utilities"):
+        raise ValueError("Unknown category")
+    return [
+        {
+            "name": name, "title": title, "version": "",
+            "description": description, "category": section,
+            "source": "apk", "removeKey": "", "installed": False
+        }
+        for name, title, description, section in FEATURED_APPS
+        if category == "All" or category == section
+    ]
+

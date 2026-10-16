@@ -1,5 +1,5 @@
 pkgname=veyra-appcenter
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=0
 pkgdesc="Veyra Linux Qt Quick application manager for APK and Nix"
 url="https://github.com/angyedz/veyra-pkgrepo"
