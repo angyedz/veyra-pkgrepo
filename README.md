@@ -6,7 +6,7 @@ Official distribution repository for Veyra-specific Alpine APK packages.
 
 Packages here complement Alpine Stable and nixpkgs. glenv is a glibc compatibility layer, **not** a package manager; no per-application glenv wrappers are required.
 
-## Planned layout
+## Repository layout
 
 ```
 stable/v1/x86_64/     # Veyra 1.x packages and APKINDEX.tar.gz
@@ -24,7 +24,7 @@ keys/                  # Public APK signing keys only
 4. Promote tested packages to `stable`; use `testing` for prereleases.
 5. Clients keep Alpine `v3.xx/main` and `community` pinned within their Veyra major version; major Alpine upgrades require an explicit `vpkg system-upgrade`.
 
-This repository is initialized but does **not** yet contain installable APKs. Do not add it to `/etc/apk/repositories` until a signed index and downloadable APKs are published and tested.
+The signed `vpkg` and `veyra-glenv` APKs and their signed index are published under `stable/v1/x86_64/`. Veyra's `scripts/setup-pkgrepo.sh` embeds the pinned public key and configures this repository. End-to-end APK installation on a clean Alpine VM is still pending validation; do not bypass signature checks.
 
 ## Hosting caveat
 
