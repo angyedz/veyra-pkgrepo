@@ -26,7 +26,7 @@ jobs:
           path: distro-source
           persist-credentials: false
       - name: Install tools
-        run: apk add --no-cache alpine-sdk go git openssl ca-certificates
+        run: apk add --no-cache alpine-sdk go git openssl ca-certificates && apk update
       - name: Test vpkg
         run: cd distro-source/vpkg && go test ./... && go vet ./...
       - name: Configure isolated builder and signing
