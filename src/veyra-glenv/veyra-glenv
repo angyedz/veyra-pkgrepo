@@ -1,0 +1,4 @@
+#!/bin/sh
+# glenv installation changes the host; run only when explicitly requested.
+set -eu
+exec sh /usr/share/veyra/glenv/install.sh "$@"
