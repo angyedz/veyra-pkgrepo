@@ -1,37 +1,26 @@
-# Veyra Package Repository
+# Veyra APK Repository
 
-Official distribution repository for Veyra-specific Alpine APK packages.
+All Veyra-specific APKBUILD recipes and application sources live in src/.
+The Go source for vpkg remains in angyedz/Veyra-Linux, which the build checks
+out into distro-source/. There are no duplicate app recipes in the distro.
 
-## Scope
+The GitHub Actions packages workflow builds with Alpine 3.22 and abuild,
+signs one combined APKINDEX and uploads APK artifacts on every PR.
 
-Packages here complement Alpine Stable and nixpkgs. glenv is a glibc compatibility layer, **not** a package manager; no per-application glenv wrappers are required.
+For signed publishing, configure the GitHub Actions secret
+VEYRA_ABUILD_PRIVATE_KEY_B64 in THIS repository. Supply the existing private
+key, base64-encoded, whose matching public key is keys/veyra.rsa.pub.
+The workflow compares DER encodings of the key pair before release.
+If the secret is unavailable, only ephemeral-key CI artifacts are produced.
+Never commit a private key; never install APKs with --allow-untrusted.
 
-## Repository layout
+Successful signed main builds update stable/v1/x86_64 atomically in a
+single Git commit, using this repo's built-in GITHUB_TOKEN (contents:write).
 
-```
-stable/v1/x86_64/     # Veyra 1.x packages and APKINDEX.tar.gz
-testing/v1/x86_64/    # Test packages
-keys/                  # Public APK signing keys only
-```
+Local Alpine build requires alpine-sdk, go, git, an abuild signing key, and
+the Veyra-Linux clone at distro-source/. Run: sh scripts/build.sh.
 
-**Never commit a private signing key.** APK files and APKINDEX must be signed with a persistent trusted key. The public key is installed on Veyra machines in `/etc/apk/keys` before enabling this repository.
-
-## Publishing policy
-
-1. Maintain Veyra-specific application sources and APKBUILD recipes under `src/` in **this repository**. The distro's signed build workflow checks out this repository and builds the APKs from `src/`; it does not use duplicate distro-side recipes for Veyra desktop packages. Signing secrets remain in the distro repository for now.
-2. Sign packages and their index with the stable Veyra abuild key.
-3. Stage a complete repository snapshot, then publish it to this repository.
-4. Promote tested packages to `stable`; use `testing` for prereleases.
-5. Clients keep Alpine `v3.xx/main` and `community` pinned within their Veyra major version; major Alpine upgrades require an explicit `vpkg system-upgrade`.
-
-The signed Veyra ecosystem APKs and their signed index are published under `stable/v1/x86_64/`. Veyra's `scripts/setup-pkgrepo.sh` embeds the pinned public key and configures this repository. End-to-end APK installation on a clean Alpine VM is still pending validation; do not bypass signature checks.
-
-## Hosting caveat
-
-GitHub's raw repository paths are not a guaranteed production APK mirror; GitHub availability in Russia and sustained binary distribution must be tested. The package layout is portable to a normal HTTPS mirror later.
-
-## First-party source packages
-
-The `src/` tree contains Veyra application sources and packaging recipes: AppCenter, Welcome, Settings, Update, Session, Hardware, Driver Manager, Compatibility, Repair, Themes, Meta and glenv. `vpkg` remains developed in the distro repository for now. Package source edits here are validated by `.github/workflows/source-checks.yml`; to publish a signed release after source changes, manually dispatch the `Veyra native packages` workflow in the distro repository until cross-repository publication automation is configured. The source tree is distinct from the signed binary repository under `stable/v1/x86_64/`.
-
-Current graphical applications are lightweight MVPs using KDE dialogs; the full Qt/QML AppCenter and Nix graphical backend are not implemented yet. Driver Manager currently diagnoses devices rather than installing drivers automatically.
+Veyra AppCenter is a Qt Quick interface for APK and optional user-scoped Nix.
+Alpine Stable and nixpkgs supply the main catalogs. glenv is a glibc runtime
+compatibility environment, not a package manager. The GitHub raw path is a
+development mirror and needs CDN validation for production use.

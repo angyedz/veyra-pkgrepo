@@ -1,0 +1,96 @@
+name: Veyra signed APK packages
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'scripts/**', '.github/workflows/packages.yml']
+  pull_request:
+    paths: ['src/**', 'scripts/**', '.github/workflows/packages.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: veyra-apk-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  packages:
+    name: Build and optionally publish signed APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    container: alpine:3.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Go source for vpkg
+        uses: actions/checkout@v4
+        with:
+          repository: angyedz/Veyra-Linux
+          path: distro-source
+          persist-credentials: false
+      - name: Install tools
+        run: apk add --no-cache alpine-sdk go git openssl ca-certificates
+      - name: Test vpkg
+        run: cd distro-source/vpkg && go test ./... && go vet ./...
+      - name: Configure isolated builder and signing
+        env:
+          VEYRA_KEY_B64: ${{ secrets.VEYRA_ABUILD_PRIVATE_KEY_B64 }}
+        run: |
+          set -eu
+          adduser -D -h /home/builder builder
+          addgroup builder abuild
+          mkdir -p /home/builder/.abuild
+          chown -R builder:builder "$GITHUB_WORKSPACE" /home/builder
+          if [ -n "$VEYRA_KEY_B64" ] && [ "${{ github.event_name }}" != pull_request ]; then
+            printf '%s' "$VEYRA_KEY_B64" | base64 -d > /home/builder/.abuild/veyra.rsa
+            chmod 0600 /home/builder/.abuild/veyra.rsa
+            cp keys/veyra.rsa.pub /home/builder/.abuild/veyra.rsa.pub
+            openssl pkey -in /home/builder/.abuild/veyra.rsa -pubout -outform DER > /tmp/key-actual.der
+            openssl pkey -pubin -in keys/veyra.rsa.pub -outform DER > /tmp/key-expected.der
+            cmp /tmp/key-actual.der /tmp/key-expected.der
+            echo stable > /tmp/veyra-sign-mode
+            key=/home/builder/.abuild/veyra.rsa
+          else
+            su builder -c 'abuild-keygen -a -n'
+            echo ephemeral > /tmp/veyra-sign-mode
+            key=$(find /home/builder/.abuild -maxdepth 1 -name '*.rsa' -print -quit)
+          fi
+          test -n "$key"
+          printf 'PACKAGER_PRIVKEY=%s\n' "$key" > /home/builder/.abuild/abuild.conf
+          chown -R builder:builder /home/builder/.abuild
+          cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
+      - name: Build package snapshot
+        run: su builder -c "cd '$GITHUB_WORKSPACE' && sh scripts/build.sh"
+      - name: Validate artifact count and index
+        run: |
+          set -eu
+          test -s packages/repo/x86_64/APKINDEX.tar.gz
+          expected=$(find src -maxdepth 2 -name APKBUILD | wc -l)
+          actual=$(find packages/repo/x86_64 -maxdepth 1 -name '*.apk' | wc -l)
+          echo "Built $actual of $expected APK packages"
+          test "$actual" -ge "$expected"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veyra-apks-${{ github.sha }}
+          path: |
+            packages/repo/x86_64/*.apk
+            packages/repo/x86_64/APKINDEX.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+      - name: Publish signed snapshot
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          set -eu
+          if [ "$(cat /tmp/veyra-sign-mode)" != stable ]; then
+            echo 'Publication skipped: add VEYRA_ABUILD_PRIVATE_KEY_B64 secret'
+            echo 'Only ephemeral CI artifacts are available.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          mkdir -p stable/v1/x86_64
+          rm -f stable/v1/x86_64/*.apk stable/v1/x86_64/APKINDEX.tar.gz
+          cp packages/repo/x86_64/*.apk stable/v1/x86_64/
+          cp packages/repo/x86_64/APKINDEX.tar.gz stable/v1/x86_64/
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A stable/v1/x86_64
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "packages: publish signed Veyra APK snapshot"
+          git push origin HEAD:main
