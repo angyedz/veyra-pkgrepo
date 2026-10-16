@@ -45,4 +45,4 @@ jobs:
       - name: Check GUI dependencies exist in Alpine repositories
         run: |
           apk update
-          apk add --simulate python3 py3-pyqt6 qt6-qtdeclarative polkit
+          apk add --simulate python3 py3-qt6 qt6-qtdeclarative polkit
