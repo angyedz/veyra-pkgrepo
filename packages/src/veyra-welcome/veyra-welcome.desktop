@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Welcome to Veyra
+Exec=veyra-welcome
+Icon=applications-system
+Terminal=false
+Categories=System;
