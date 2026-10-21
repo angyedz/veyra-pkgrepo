@@ -37,11 +37,12 @@ the captured output pipe, and standard error open; inability to close inherited
 descriptors fails closed.
 
 The package build is checked against Alpine 3.22 with warnings treated as
-errors. `tests/test-session-auth.sh` runs the PAM account and session hooks
-through a real PTY, using `pam_permit` only as a test authentication backend.
-It checks wrong-PID rejection, mapping revalidation, one-use consumption, and
-monotonic expiry. These tests cover the PAM grant primitive only; they do not
-prove an installed login broker or user-root session manager.
+errors. `tests/test-session-auth.sh` creates a temporary system account and
+uses `pam_unix` to check both a wrong and a correct password, then runs the PAM
+account and session hooks through a real PTY. It checks wrong-PID rejection,
+mapping revalidation, one-use consumption, monotonic expiry, and PAM
+close-session cleanup. These tests cover the PAM grant primitive only; they do
+not prove an installed login broker or user-root session manager.
 
 The PAM service is deliberately separate. This package does not change the
 global `login`, SSH, or SDDM PAM stacks, change account shells, launch a user
