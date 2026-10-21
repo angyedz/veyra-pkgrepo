@@ -721,9 +721,23 @@ static int print_registry(const struct registry *registry) {
     return ferror(stdout) ? fail("could not write registry listing") : 0;
 }
 
+static int resolve_account(struct registry *registry, const char *name) {
+    struct account_record *record = find_record(registry, name);
+    if (record == NULL) return fail("account is not enrolled");
+    if (record->retired) return fail("account enrollment is retired");
+    const struct passwd *pw = lookup_eligible_account(name);
+    if (pw == NULL) return 1;
+    if (record->system_uid != (uint32_t)pw->pw_uid ||
+        record->system_gid != (uint32_t)pw->pw_gid)
+        return fail("system account identity changed after enrollment");
+    printf("resolved\t%s\t%u\t%u\t%u\n", record->name,
+           record->system_uid, record->system_gid, record->uid_base);
+    return ferror(stdout) ? fail("could not write account mapping") : 0;
+}
+
 static void usage(FILE *stream) {
     fprintf(stream,
-            "Usage: veyra-account-registry {enroll USER|retire USER|list}\n");
+            "Usage: veyra-account-registry {enroll USER|retire USER|resolve USER|list}\n");
 }
 
 int main(int argc, char **argv) {
@@ -739,7 +753,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (strcmp(argv[1], "list") != 0 &&
-        strcmp(argv[1], "enroll") != 0 && strcmp(argv[1], "retire") != 0) {
+        strcmp(argv[1], "enroll") != 0 && strcmp(argv[1], "retire") != 0 &&
+        strcmp(argv[1], "resolve") != 0) {
         usage(stderr);
         return 2;
     }
@@ -767,6 +782,8 @@ int main(int argc, char **argv) {
     int result = 0;
     if (strcmp(argv[1], "list") == 0) {
         result = print_registry(&registry);
+    } else if (strcmp(argv[1], "resolve") == 0) {
+        result = resolve_account(&registry, argv[2]);
     } else if (strcmp(argv[1], "enroll") == 0) {
         const struct passwd *pw = lookup_eligible_account(argv[2]);
         if (pw == NULL) {

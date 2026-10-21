@@ -86,6 +86,9 @@ output=$("$binary" enroll veyratestalpha)
 output=$("$binary" enroll veyratestalpha)
 [ "$output" = "already-enrolled${tab}veyratestalpha${tab}300000" ] || \
     fail "repeat enrollment was not idempotent"
+output=$("$binary" resolve veyratestalpha)
+[ "$output" = "resolved${tab}veyratestalpha${tab}23101${tab}23101${tab}300000" ] || \
+    fail "active account did not resolve to its stored identity and range"
 output=$("$binary" enroll veyratestbeta)
 [ "$output" = "enrolled${tab}veyratestbeta${tab}23102:23102${tab}400000" ] || \
     fail "second enrollment did not receive the next range"
@@ -104,6 +107,7 @@ concurrent_bases=$(printf '%s\n%s\n' "$gamma_base" "$delta_base" | sort -n | tr 
 output=$("$binary" retire veyratestbeta)
 [ "$output" = "retired${tab}veyratestbeta${tab}400000" ] || \
     fail "retirement did not preserve the reservation"
+expect_fail "$binary" resolve veyratestbeta
 output=$("$binary" enroll veyratestepsilon)
 [ "$output" = "enrolled${tab}veyratestepsilon${tab}23105:23105${tab}700000" ] || \
     fail "retired range was reused"
@@ -115,6 +119,19 @@ expect_fail "$binary" enroll veyratestlocked
 expect_fail "$binary" enroll ../veyra-test
 expect_fail "$binary" retire veyratestwheel
 
+usermod -a -G wheel veyratestalpha
+expect_fail "$binary" resolve veyratestalpha
+usermod -G '' veyratestalpha
+output=$("$binary" resolve veyratestalpha)
+[ "$output" = "resolved${tab}veyratestalpha${tab}23101${tab}23101${tab}300000" ] || \
+    fail "account did not resolve after its host privilege group was removed"
+usermod -u 23111 veyratestalpha
+expect_fail "$binary" resolve veyratestalpha
+usermod -u 23101 veyratestalpha
+output=$("$binary" resolve veyratestalpha)
+[ "$output" = "resolved${tab}veyratestalpha${tab}23101${tab}23101${tab}300000" ] || \
+    fail "account did not resolve after its original system UID was restored"
+
 [ ! -e "$policy_file" ] || fail "sudo policy test path already exists"
 created_policy=1
 printf '%s ALL=(ALL:ALL) ALL\n' veyratestdirect >"$policy_file"
@@ -125,6 +142,18 @@ expect_fail "$binary" enroll veyratestdirect
 rm "$policy_file"
 created_policy=0
 visudo -c >/dev/null 2>&1 || fail "sudoers policy was not restored"
+output=$("$binary" enroll veyratestdirect)
+[ "$output" = "enrolled${tab}veyratestdirect${tab}23110:23110${tab}800000" ] || \
+    fail "direct-policy test account did not enroll before privilege grant"
+created_policy=1
+printf '%s ALL=(ALL:ALL) ALL\n' veyratestdirect >"$policy_file"
+chown root:root "$policy_file"
+chmod 0440 "$policy_file"
+visudo -c >/dev/null 2>&1 || fail "second sudoers entry is invalid"
+expect_fail "$binary" resolve veyratestdirect
+rm "$policy_file"
+created_policy=0
+visudo -c >/dev/null 2>&1 || fail "sudoers policy was not restored after resolution check"
 
 registry=$store/registry/accounts.v1
 grep -Fq "retired${tab}veyratestbeta${tab}23102${tab}23102${tab}400000" \

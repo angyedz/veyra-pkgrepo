@@ -17,6 +17,7 @@ Commands:
 ```text
 veyra-account-registry enroll USER
 veyra-account-registry retire USER
+veyra-account-registry resolve USER
 veyra-account-registry list
 ```
 
@@ -29,6 +30,14 @@ Password verifiers are checked through the system shadow database but are
 never copied to the registry or user root. Mappings start at outer UID/GID
 base 300000 and advance in non-overlapping 100000-ID slots. Failed allocation
 never reuses an earlier slot.
+
+`resolve USER` is the manager-facing lookup for an enrolled account. On every
+call it rechecks the current password state, shell, expiry, host privilege
+groups and sudo policy, and confirms that the system UID/GID still match the
+enrolled values. It emits one tab-separated record containing the account
+name, system UID, system GID and reserved mapped-ID base. It never emits
+password data. A missing, retired, changed or newly privileged account fails
+closed.
 
 This package only manages identity-to-range reservations. It does not create
 or mount user roots, start sessions, provide a login broker, or enable the
