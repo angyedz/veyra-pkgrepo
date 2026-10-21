@@ -27,6 +27,10 @@ jobs:
           persist-credentials: false
       - name: Install tools
         run: apk add --no-cache alpine-sdk go git openssl ca-certificates && apk update
+      - name: Verify root-owned account registry behavior
+        run: |
+          apk add --no-cache shadow sudo
+          sh tests/test-account-registry.sh
       - name: Test vpkg
         run: cd distro-source/vpkg && go test ./... && go vet ./...
       - name: Configure isolated builder and signing
