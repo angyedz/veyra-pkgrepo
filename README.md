@@ -4,6 +4,11 @@ All Veyra-specific APKBUILD recipes and application sources live in src/.
 The Go source for vpkg remains in angyedz/Veyra-Linux, which the build checks
 out into distro-source/. There are no duplicate app recipes in the distro.
 
+This is a mixed package repository: it contains packages for the system
+environment and packages intended for isolated user environments. They share
+the signed APK repository, while each package's recipe defines its role and
+installation scope.
+
 The GitHub Actions packages workflow builds with Alpine 3.22 and abuild,
 signs one combined APKINDEX and uploads APK artifacts on every PR.
 
