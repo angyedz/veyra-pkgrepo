@@ -644,8 +644,7 @@ static bool sudo_policy_is_clear(const char *name) {
         report_errno("wait for host sudo policy query");
         return false;
     }
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 1 &&
-        strstr(output, "is not allowed to run sudo") != NULL) return true;
+    if (strstr(output, "is not allowed to run sudo") != NULL) return true;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         (void)fail("host sudo policy grants this account a sudo authorization");
         return false;
