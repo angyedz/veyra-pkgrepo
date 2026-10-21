@@ -26,7 +26,7 @@ def launch(driver, running):
             if slave > 2:
                 os.close(slave)
             os.close(master)
-            os.execv(driver, [driver, "nobody", tty])
+            os.execv(driver, [driver, tty])
         except Exception as error:
             os.write(2, ("test harness child: " + str(error) + "\n").encode())
             os._exit(127)
@@ -66,19 +66,26 @@ def consume(binary, token, pid):
 
 
 def stop_all(running):
+    cleanup_failures = []
     for pid, master in running:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         try:
-            os.waitpid(pid, 0)
+            waited, status = os.waitpid(pid, 0)
+            if waited == pid and (
+                not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0
+            ):
+                cleanup_failures.append((pid, status))
         except ChildProcessError:
             pass
         try:
             os.close(master)
         except OSError:
             pass
+    if cleanup_failures:
+        fail("PAM close-session cleanup failed: " + repr(cleanup_failures))
 
 
 def main():
