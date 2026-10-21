@@ -1,0 +1,7 @@
+# Dedicated Veyra TTY login profile. pam_unix performs system password auth;
+# the Veyra module then rechecks registry eligibility and issues a short-lived,
+# one-use grant for the authenticated PAM session.
+auth    required pam_unix.so
+account required pam_unix.so
+account required pam_veyra_session.so
+session required pam_veyra_session.so
