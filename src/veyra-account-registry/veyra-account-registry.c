@@ -104,6 +104,7 @@ static bool safe_root_directory(int fd, const char *label, bool exact_mode) {
     return true;
 }
 
+#ifndef VEYRA_REGISTRY_TESTING
 static int open_component(int parent, const char *name, const char *label) {
     int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
@@ -135,6 +136,7 @@ static bool exact_ext4_mount(const char *path) {
     endmntent(mounts);
     return found;
 }
+#endif
 
 static int open_store(void) {
 #ifdef VEYRA_REGISTRY_TESTING
