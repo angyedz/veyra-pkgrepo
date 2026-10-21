@@ -14,11 +14,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
-#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -286,7 +287,6 @@ static int read_process_identity(pid_t pid, uid_t *uid, gid_t *gid,
     int procfd = -1;
     int processfd = -1;
     int fd = -1;
-    int ttyfd = -1;
     int result = -1;
     int saved = 0;
     char pid_text[32];
@@ -351,9 +351,11 @@ static int read_process_identity(pid_t pid, uid_t *uid, gid_t *gid,
     }
     char state = '\0';
     long parent_pid, process_group, process_session;
-    if (sscanf(close_paren + 2, "%c %ld %ld %ld", &state, &parent_pid,
-               &process_group, &process_session) != 4 || state == 'Z' ||
-        process_session <= 1 || process_session > INT_MAX) {
+    long long tty_number;
+    if (sscanf(close_paren + 2, "%c %ld %ld %ld %lld", &state, &parent_pid,
+               &process_group, &process_session, &tty_number) != 5 ||
+        state == 'Z' || process_session <= 1 || process_session > INT_MAX ||
+        tty_number <= 0 || (unsigned long long)tty_number > UINT32_MAX) {
         errno = EACCES;
         goto done;
     }
@@ -378,19 +380,24 @@ static int read_process_identity(pid_t pid, uid_t *uid, gid_t *gid,
     unsigned long long parsed_start = strtoull(cursor, &end, 10);
     if (errno != 0 || end == cursor) { errno = EIO; goto done; }
 
-    ttyfd = openat(processfd, "fd/0",
-                   O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
-    if (ttyfd < 0) goto done;
-    struct stat tty_stat;
-    if (fstat(ttyfd, &tty_stat) < 0 || !S_ISCHR(tty_stat.st_mode)) {
-        errno = ENOTTY;
+    /* /proc/<pid>/stat encodes tty_nr with new_encode_dev(). Decode it here
+     * instead of opening /proc/<pid>/fd/0, which requires CAP_SYS_PTRACE in
+     * hardened containers and incorrectly ties session identity to stdin. */
+    unsigned long long encoded_tty = (unsigned long long)tty_number;
+    unsigned int tty_major = (unsigned int)((encoded_tty >> 8) & 0xfffU);
+    unsigned int tty_minor = (unsigned int)((encoded_tty & 0xffU) |
+        ((encoded_tty >> 12) & 0xffffff00U));
+    dev_t controlling_tty = makedev(tty_major, tty_minor);
+    if ((unsigned int)major(controlling_tty) != tty_major ||
+        (unsigned int)minor(controlling_tty) != tty_minor) {
+        errno = EOVERFLOW;
         goto done;
     }
     *uid = (uid_t)real_uid;
     *gid = (gid_t)real_gid;
     *sid = (pid_t)process_session;
     *starttime = (uint64_t)parsed_start;
-    *tty_device = (uint64_t)tty_stat.st_rdev;
+    *tty_device = (uint64_t)controlling_tty;
     struct pollfd process_poll = { .fd = pidfd, .events = POLLIN };
     int poll_result = poll(&process_poll, 1U, 0);
     if (poll_result < 0) goto done;
@@ -398,7 +405,6 @@ static int read_process_identity(pid_t pid, uid_t *uid, gid_t *gid,
     result = 0;
 done:
     if (result < 0) saved = errno;
-    if (ttyfd >= 0) close(ttyfd);
     if (fd >= 0) close(fd);
     if (processfd >= 0) close(processfd);
     if (procfd >= 0) close(procfd);
