@@ -1,0 +1,18 @@
+pkgname=veyra-user-root-provisioner
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="System-side persistent per-account Veyra user-root provisioner"
+url="https://github.com/angyedz/Veyra-Linux"
+arch="noarch"
+license="MIT"
+depends="veyra-account-registry coreutils util-linux-misc"
+options="!check"
+source=""
+builddir="$srcdir"
+
+package() {
+    install -Dm755 "$startdir/veyra-user-root-provisioner" \
+        "$pkgdir/usr/sbin/veyra-user-root-provisioner"
+    install -Dm644 "$startdir/README.md" \
+        "$pkgdir/usr/share/doc/veyra-user-root-provisioner/README.md"
+}

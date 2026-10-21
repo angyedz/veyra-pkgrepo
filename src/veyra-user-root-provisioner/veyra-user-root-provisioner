@@ -1,0 +1,253 @@
+#!/bin/sh
+set -eu
+umask 077
+
+store=/var/lib/veyra-user-store
+users=$store/users
+template=/usr/share/veyra/user-root-template
+registry=/usr/sbin/veyra-account-registry
+lock_dir=/run/veyra-user-root-provisioner
+
+fail() { echo "veyra-user-root-provisioner: $*" >&2; exit 1; }
+usage() { echo "Usage: veyra-user-root-provisioner {provision|verify} USER" >&2; exit 2; }
+valid_name() {
+    case "$1" in ''|[!a-z_]*|*[!a-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 32 ]
+}
+
+[ "$(id -u)" -eq 0 ] || fail "must be run by system root"
+[ "$#" -eq 2 ] || usage
+action=$1
+name=$2
+case "$action" in provision|verify) ;; *) usage ;; esac
+valid_name "$name" || fail "account name is invalid"
+[ -x "$registry" ] && [ ! -L "$registry" ] || fail "account registry is unavailable"
+
+# The registry is authoritative for eligibility and identity. In production,
+# resolve also verifies that the persistent store is its own ext4 mount.
+mapping=$("$registry" resolve "$name") || fail "account is not eligible for a user root"
+tab=$(printf '\t')
+case "$mapping" in "resolved${tab}${name}${tab}"*) ;; *) fail "invalid registry mapping" ;; esac
+rest=${mapping#"resolved${tab}${name}${tab}"}
+system_uid=${rest%%"$tab"*}
+rest=${rest#*"$tab"}
+system_gid=${rest%%"$tab"*}
+uid_base=${rest#*"$tab"}
+case "$system_uid" in ''|*[!0-9]*) fail "invalid system UID" ;; esac
+case "$system_gid" in ''|*[!0-9]*) fail "invalid system GID" ;; esac
+case "$uid_base" in ''|*[!0-9]*|*"$tab"*) fail "invalid registry range" ;; esac
+[ "$system_uid" -ge 1000 ] && [ "$system_uid" -lt 60000 ] || fail "invalid system UID"
+[ "$system_gid" -gt 0 ] && [ "$system_gid" -lt 60000 ] || fail "invalid system GID"
+[ "$uid_base" -ge 100000 ] && [ "$uid_base" -le 4294900000 ] &&
+    [ "$((uid_base % 100000))" -eq 0 ] || fail "invalid mapped-ID range"
+mapped_user_id=$((uid_base + 1000))
+account_dir=$users/$name
+rootfs=$account_dir/rootfs
+home=$account_dir/home
+metadata=$account_dir/account.v1
+
+if [ -L "$lock_dir" ]; then fail "runtime lock path is a symlink"; fi
+if [ ! -e "$lock_dir" ]; then mkdir -m 0700 "$lock_dir"; fi
+[ -d "$lock_dir" ] && [ "$(stat -c '%u:%g:%a' "$lock_dir")" = "0:0:700" ] ||
+    fail "runtime lock path has unsafe ownership or mode"
+lock_file=$lock_dir/provision.lock
+[ ! -L "$lock_file" ] || fail "runtime lock file is a symlink"
+if [ ! -e "$lock_file" ]; then (umask 077; : > "$lock_file"); fi
+[ -f "$lock_file" ] && [ "$(stat -c '%u:%g:%a' "$lock_file")" = "0:0:600" ] ||
+    fail "runtime lock file has unsafe ownership or mode"
+exec 9>"$lock_file"
+flock -x 9
+
+verify_account() {
+    [ -d "$account_dir" ] && [ ! -L "$account_dir" ] || fail "account storage is missing or unsafe"
+    [ "$(stat -c '%u:%g:%a' "$account_dir")" = "0:0:700" ] || fail "unsafe account storage mode"
+    [ -f "$metadata" ] && [ ! -L "$metadata" ] || fail "account metadata is missing or unsafe"
+    [ "$(stat -c '%u:%g:%a' "$metadata")" = "0:0:600" ] || fail "unsafe account metadata mode"
+    expected=$(printf 'VEYRA-USER-ROOT\t1\naccount\t%s\t%s\t%s\t%s\n' \
+        "$name" "$system_uid" "$system_gid" "$uid_base")
+    [ "$(cat "$metadata")" = "$expected" ] || fail "account metadata does not match registry identity"
+    [ -d "$rootfs" ] && [ ! -L "$rootfs" ] || fail "user rootfs is missing or unsafe"
+    [ -x "$rootfs/sbin/init" ] || fail "user rootfs has no executable /sbin/init"
+    [ -d "$home" ] && [ ! -L "$home" ] || fail "persistent home is missing or unsafe"
+    [ "$(stat -c '%u:%g:%a' "$home")" = "$mapped_user_id:$mapped_user_id:700" ] ||
+        fail "persistent home has unexpected mapped ownership or mode"
+    [ -d "$rootfs/home/$name" ] && [ ! -L "$rootfs/home/$name" ] ||
+        fail "user rootfs has no safe home mountpoint"
+    [ -f "$rootfs/etc/passwd" ] && [ ! -L "$rootfs/etc/passwd" ] || fail "unsafe user passwd file"
+    awk -F: -v name="$name" '$1 == name && $3 == 1000 && $4 == 1000 && $6 == "/home/" name { found++ }
+        END { exit !(found == 1) }' "$rootfs/etc/passwd" || fail "user rootfs identity mismatch"
+    [ -f "$rootfs/etc/group" ] && [ ! -L "$rootfs/etc/group" ] || fail "unsafe user group file"
+    awk -F: -v name="$name" '$1 == name && $3 == 1000 { found++ }
+        END { exit !(found == 1) }' "$rootfs/etc/group" || fail "user rootfs group identity mismatch"
+    [ -f "$rootfs/etc/shadow" ] && [ ! -L "$rootfs/etc/shadow" ] || fail "unsafe user shadow file"
+    awk -F: -v name="$name" '
+        $1 == name && $2 == "!" { found++ }
+        $2 !~ /^[!*]/ || $2 == "" { invalid=1 }
+        END { exit !(found == 1 && !invalid) }
+    ' "$rootfs/etc/shadow" || fail "user-root password fields must remain locked"
+}
+
+if [ "$action" = verify ]; then
+    verify_account
+    echo "verified${tab}${name}${tab}${uid_base}"
+    exit 0
+fi
+
+if [ -e "$users" ] || [ -L "$users" ]; then
+    [ -d "$users" ] && [ ! -L "$users" ] || fail "user storage directory is unsafe"
+    [ "$(stat -c '%u:%g:%a' "$users")" = "0:0:700" ] || fail "unsafe user storage mode"
+else
+    mkdir -m 0700 "$users"
+    chown 0:0 "$users"
+fi
+if [ -e "$account_dir" ] || [ -L "$account_dir" ]; then
+    verify_account
+    echo "already-provisioned${tab}${name}${tab}${uid_base}"
+    exit 0
+fi
+
+[ -d "$template" ] && [ ! -L "$template" ] || fail "trusted user-root template is missing or unsafe"
+[ "$(stat -c '%u:%g' "$template")" = "0:0" ] || fail "template must be owned by system root"
+template_mode=$(stat -c '%a' "$template")
+case "$template_mode" in *[!0-7]*|'') fail "template has an invalid mode" ;; esac
+[ "$((0$template_mode & 022))" -eq 0 ] || fail "template is writable by group or other users"
+[ -f "$template/.veyra-user-template" ] && [ ! -L "$template/.veyra-user-template" ] ||
+    fail "template marker is missing or unsafe"
+[ "$(stat -c '%u:%g:%a' "$template/.veyra-user-template")" = "0:0:644" ] ||
+    fail "template marker must be system-root-owned and read-only"
+[ "$(cat "$template/.veyra-user-template")" = "VEYRA-USER-ROOT-TEMPLATE 1" ] ||
+    fail "unsupported template marker"
+[ -x "$template/sbin/init" ] || fail "template has no executable /sbin/init"
+[ -d "$template/home/veyrauser" ] && [ ! -L "$template/home/veyrauser" ] ||
+    fail "template has no safe inner-user home skeleton"
+[ -f "$template/usr/bin/sudo" ] && [ ! -L "$template/usr/bin/sudo" ] ||
+    fail "template has no regular inner sudo binary"
+[ -f "$template/etc/passwd" ] && [ ! -L "$template/etc/passwd" ] || fail "template passwd file is unsafe"
+[ -f "$template/etc/shadow" ] && [ ! -L "$template/etc/shadow" ] || fail "template shadow file is unsafe"
+[ -f "$template/etc/group" ] && [ ! -L "$template/etc/group" ] || fail "template group file is unsafe"
+[ -f "$template/etc/sudoers" ] && [ ! -L "$template/etc/sudoers" ] || fail "template sudo policy is unsafe"
+if [ -d "$template/etc/sudoers.d" ]; then
+    [ ! -L "$template/etc/sudoers.d" ] || fail "template sudo policy directory is a symlink"
+    if grep -R -E -q 'NOPASSWD|!authenticate' "$template/etc/sudoers" "$template/etc/sudoers.d"; then
+        fail "template contains a passwordless sudo rule"
+    else
+        grep_status=$?
+        [ "$grep_status" -eq 1 ] || fail "cannot validate template sudo policy"
+    fi
+else
+    if grep -E -q 'NOPASSWD|!authenticate' "$template/etc/sudoers"; then
+        fail "template contains a passwordless sudo rule"
+    else
+        grep_status=$?
+        [ "$grep_status" -eq 1 ] || fail "cannot validate template sudo policy"
+    fi
+fi
+awk -F: '$1 == "veyrauser" && $3 == 1000 && $4 == 1000 && $6 == "/home/veyrauser" { found++ }
+    END { exit !(found == 1) }' "$template/etc/passwd" || fail "template inner identity is invalid"
+awk -F: '$1 == "veyrauser" && $3 == 1000 { found++ }
+    END { exit !(found == 1) }' "$template/etc/group" || fail "template inner group is invalid"
+awk -F: '$1 == "root" && $2 ~ /^[!*]/ { found++ }
+    $1 != "veyrauser" && ($2 !~ /^[!*]/ || $2 == "") { invalid=1 }
+    END { exit !(found == 1 && !invalid) }' "$template/etc/shadow" ||
+    fail "template contains an unlocked or reusable password verifier"
+
+stage=$users/.$name.provision.$$
+[ ! -e "$stage" ] && [ ! -L "$stage" ] || fail "staging path already exists"
+cleanup() { [ ! -e "$stage" ] || rm -rf -- "$stage"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+mkdir -m 0700 "$stage"
+mkdir -m 0700 "$stage/rootfs" "$stage/home"
+cp -a "$template/." "$stage/rootfs/"
+cp -a "$stage/rootfs/home/veyrauser/." "$stage/home/"
+rm -rf -- "$stage/rootfs/home/veyrauser"
+mkdir -m 0700 "$stage/rootfs/home/$name"
+
+rewrite_passwd() {
+    path=$1
+    temp=$path.veyra-tmp.$$
+    mode=$(stat -c '%a' "$path")
+    awk -F: -v OFS=: -v old=veyrauser -v name="$name" '
+        BEGIN { found=0; collision=0 }
+        $1 == name && name != old { collision=1 }
+        $1 == old {
+            if (NF < 7 || $3 != 1000 || $4 != 1000 || $6 != "/home/veyrauser") exit 1
+            $1=name; $6="/home/" name; found++
+        }
+        { print }
+        END { if (found != 1 || collision) exit 1 }
+    ' "$path" > "$temp" || { rm -f "$temp"; fail "template passwd entry is invalid"; }
+    chown 0:0 "$temp"
+    chmod "$mode" "$temp"
+    mv -f "$temp" "$path"
+}
+rewrite_shadow() {
+    path=$1
+    temp=$path.veyra-tmp.$$
+    mode=$(stat -c '%a' "$path")
+    awk -F: -v OFS=: -v old=veyrauser -v name="$name" '
+        BEGIN { found=0; collision=0 }
+        $1 == name && name != old { collision=1 }
+        $1 == old { if (NF < 2) exit 1; $1=name; $2="!"; found++ }
+        { print }
+        END { if (found != 1 || collision) exit 1 }
+    ' "$path" > "$temp" || { rm -f "$temp"; fail "template shadow entry is invalid"; }
+    chown 0:0 "$temp"
+    chmod "$mode" "$temp"
+    mv -f "$temp" "$path"
+}
+rewrite_group_file() {
+    path=$1
+    format=$2
+    temp=$path.veyra-tmp.$$
+    mode=$(stat -c '%a' "$path")
+    awk -F: -v OFS=: -v old=veyrauser -v name="$name" -v format="$format" '
+        function replace_members(value, count, parts, i, result) {
+            if (value == "") return value
+            count=split(value, parts, ","); result=""
+            for (i=1; i<=count; i++) {
+                if (parts[i] == old) parts[i]=name
+                result=result (i == 1 ? "" : ",") parts[i]
+            }
+            return result
+        }
+        BEGIN { found=0; collision=0 }
+        $1 == name && name != old { collision=1 }
+        $1 == old {
+            if (format == "group" && (NF < 4 || $3 != 1000)) exit 1
+            $1=name; found++
+        }
+        format == "group" && NF >= 4 { $4=replace_members($4) }
+        format == "gshadow" && NF >= 4 { $3=replace_members($3); $4=replace_members($4) }
+        { print }
+        END { if (found != 1 || collision) exit 1 }
+    ' "$path" > "$temp" || { rm -f "$temp"; fail "template $format identity is invalid"; }
+    chown 0:0 "$temp"
+    chmod "$mode" "$temp"
+    mv -f "$temp" "$path"
+}
+rewrite_passwd "$stage/rootfs/etc/passwd"
+rewrite_shadow "$stage/rootfs/etc/shadow"
+rewrite_group_file "$stage/rootfs/etc/group" group
+if [ -f "$stage/rootfs/etc/gshadow" ]; then
+    [ ! -L "$stage/rootfs/etc/gshadow" ] || fail "template gshadow file is unsafe"
+    rewrite_group_file "$stage/rootfs/etc/gshadow" gshadow
+fi
+chown -hR "$uid_base:$uid_base" "$stage/rootfs"
+chown -hR "$mapped_user_id:$mapped_user_id" "$stage/home"
+chown "$mapped_user_id:$mapped_user_id" "$stage/rootfs/home/$name"
+chown "$uid_base:$mapped_user_id" "$stage/rootfs"
+chmod 0710 "$stage/rootfs"
+chmod 0700 "$stage/home" "$stage/rootfs/home/$name"
+chmod 4755 "$stage/rootfs/usr/bin/sudo"
+printf 'VEYRA-USER-ROOT\t1\naccount\t%s\t%s\t%s\t%s\n' \
+    "$name" "$system_uid" "$system_gid" "$uid_base" > "$stage/account.v1"
+chown 0:0 "$stage/account.v1"
+chmod 0600 "$stage/account.v1"
+sync -f "$stage/rootfs"
+sync -f "$stage/home"
+mv "$stage" "$account_dir"
+stage=
+sync -f "$users"
+verify_account
+echo "provisioned${tab}${name}${tab}${uid_base}"
