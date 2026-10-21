@@ -150,6 +150,13 @@ awk -F: '$1 == "root" && $2 ~ /^[!*]/ { found++ }
     $1 != "veyrauser" && ($2 !~ /^[!*]/ || $2 == "") { invalid=1 }
     END { exit !(found == 1 && !invalid) }' "$template/etc/shadow" ||
     fail "template contains an unlocked or reusable password verifier"
+if [ -e "$template/etc/gshadow" ]; then
+    [ -f "$template/etc/gshadow" ] && [ ! -L "$template/etc/gshadow" ] ||
+        fail "template gshadow file is unsafe"
+    awk -F: '$2 !~ /^[!*]/ || $2 == "" { invalid=1 }
+        END { exit invalid }' "$template/etc/gshadow" ||
+        fail "template contains an unlocked or reusable group verifier"
+fi
 
 stage=$users/.$name.provision.$$
 [ ! -e "$stage" ] && [ ! -L "$stage" ] || fail "staging path already exists"

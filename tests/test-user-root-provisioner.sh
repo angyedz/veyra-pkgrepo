@@ -61,6 +61,11 @@ root:x:0:
 veyrauser:x:1000:
 wheel:x:10:veyrauser
 EOF
+cat >"$template/etc/gshadow" <<'EOF'
+root:!::
+veyrauser:!::
+wheel:!::veyrauser
+EOF
 printf '%s\n' 'root ALL=(ALL:ALL) ALL' >"$template/etc/sudoers"
 printf '%s\n' 'export VEYRA_TEMPLATE_HOME=present' >"$template/home/veyrauser/.profile"
 
@@ -82,6 +87,10 @@ grep -q '^alice:x:1000:$' "$account_dir/rootfs/etc/group" ||
     fail "inner primary group was not renamed"
 grep -q '^wheel:x:10:alice$' "$account_dir/rootfs/etc/group" ||
     fail "supplementary group membership was not renamed"
+grep -q '^alice:!::$' "$account_dir/rootfs/etc/gshadow" ||
+    fail "inner group shadow identity was not renamed"
+grep -q '^wheel:!::alice$' "$account_dir/rootfs/etc/gshadow" ||
+    fail "inner group shadow membership was not renamed"
 grep -q '^alice:!:1:0:' "$account_dir/rootfs/etc/shadow" ||
     fail "inner password verifier was not discarded and locked"
 [ -f "$account_dir/home/.profile" ] || fail "home skeleton was not copied to separate persistent storage"
