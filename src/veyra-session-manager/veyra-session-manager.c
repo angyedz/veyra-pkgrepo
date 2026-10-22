@@ -763,8 +763,12 @@ static int wait_byte(int fd, char expected, int timeout_ms) {
     struct pollfd item = { .fd = fd, .events = POLLIN };
     int result;
     do { result = poll(&item, 1U, timeout_ms); } while (result < 0 && errno == EINTR);
+    if (result == 0) { errno = ETIMEDOUT; return -1; }
+    if (result < 0) return -1;
     char value = 0;
-    return result > 0 && read(fd, &value, 1U) == 1 && value == expected ? 0 : -1;
+    ssize_t amount = read(fd, &value, 1U);
+    if (amount != 1 || value != expected) { errno = ECHILD; return -1; }
+    return 0;
 }
 
 static void child_fail(const char *message) {
@@ -1031,21 +1035,35 @@ static int relay_session(int socket_fd, int master_fd, int tty_fd, pid_t launche
     return result;
 }
 
+static int format_launch_error(char *error, size_t error_size,
+                               const char *stage) {
+    int saved = errno == 0 ? EIO : errno;
+    if (error_size > 0U)
+        (void)snprintf(error, error_size, "%s: %s", stage, strerror(saved));
+    errno = saved;
+    return -1;
+}
+
 static int create_namespace_session(int socket_fd, int tty_fd,
                                    const struct authorized_session *session,
                                    const char *term, int rootfd, int homefd,
-                                   const char *shell) {
+                                   const char *shell, char *launch_error,
+                                   size_t launch_error_size) {
+    const char *stage = "allocate private terminal";
     int master = -1, slave = -1;
     master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (master < 0 || grantpt(master) < 0 || unlockpt(master) < 0) goto fail;
+    stage = "open private terminal slave";
     char slave_name[PATH_MAX];
-    if (ptsname_r(master, slave_name, sizeof(slave_name)) != 0) goto fail;
+    int ptsname_result = ptsname_r(master, slave_name, sizeof(slave_name));
+    if (ptsname_result != 0) { errno = ptsname_result; goto fail; }
     slave = open(slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (slave < 0) goto fail;
     struct winsize window = {0};
     if (ioctl(tty_fd, TIOCGWINSZ, &window) == 0)
         (void)ioctl(slave, TIOCSWINSZ, &window);
 
+    stage = "validate user root filesystem";
     char error[256] = {0};
     char checked_shell[PATH_MAX] = {0};
     if (validate_rootfs(rootfd, homefd, session, checked_shell,
@@ -1053,25 +1071,34 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         strcmp(checked_shell, shell) != 0) {
         fprintf(stderr, "veyra-session-manager: refused rootfs for %s: %s\n",
                 session->account, error[0] ? error : "shell changed during validation");
+        errno = EINVAL;
         goto fail;
     }
+    stage = "create private mount namespace";
     if (unshare(CLONE_NEWNS) < 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
         goto fail;
     char pin_dir[PATH_MAX];
+    stage = "pin user root filesystems";
     if (prepare_pins(rootfd, homefd, session->uid_base,
                      pin_dir, sizeof(pin_dir)) < 0) goto fail;
+    stage = "create namespace synchronization pipes";
     int map_ready[2], map_go[2], session_ready[2];
     if (pipe2(map_ready, O_CLOEXEC) < 0 || pipe2(map_go, O_CLOEXEC) < 0 ||
         pipe2(session_ready, O_CLOEXEC) < 0) {
+        int saved = errno;
         cleanup_pins(pin_dir);
+        errno = saved;
         goto fail;
     }
+    stage = "start namespace launcher";
     pid_t expected_parent = getpid();
     pid_t launcher = fork();
     if (launcher < 0) {
+        int saved = errno;
         close(map_ready[0]); close(map_ready[1]); close(map_go[0]); close(map_go[1]);
         close(session_ready[0]); close(session_ready[1]);
         cleanup_pins(pin_dir);
+        errno = saved;
         goto fail;
     }
     if (launcher == 0) {
@@ -1091,61 +1118,93 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         _exit(1);
     }
     close(map_ready[1]); close(map_go[0]); close(session_ready[1]); close(slave);
+    stage = "wait for mapped user namespace";
     if (wait_byte(map_ready[0], 'U', 10000) < 0) {
+        int saved = errno;
         close(map_ready[0]); close(map_go[1]); close(session_ready[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
-        cleanup_pins(pin_dir); close(master); return -1;
+        cleanup_pins(pin_dir); close(master); errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
     }
     close(map_ready[0]);
+    stage = "write user namespace ID maps";
     char uid_map[64], gid_map[64];
     if (snprintf(uid_map, sizeof(uid_map), "0 %u %u\n", session->uid_base, MAP_LENGTH) >= (int)sizeof(uid_map) ||
         snprintf(gid_map, sizeof(gid_map), "0 %u %u\n", session->uid_base, MAP_LENGTH) >= (int)sizeof(gid_map)) {
+        errno = EOVERFLOW;
+        int saved = errno;
         close(map_go[1]); close(session_ready[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
-        cleanup_pins(pin_dir); close(master); errno = EOVERFLOW; return -1;
+        cleanup_pins(pin_dir); close(master); errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
     }
     char proc_path[96];
     if (snprintf(proc_path, sizeof(proc_path), "/proc/%ld/setgroups", (long)launcher) >= (int)sizeof(proc_path)) {
+        errno = EOVERFLOW;
+        int saved = errno;
         close(map_go[1]); close(session_ready[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
-        cleanup_pins(pin_dir); close(master); errno = EOVERFLOW; return -1;
+        cleanup_pins(pin_dir); close(master); errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
     }
+    stage = "disable supplementary group mapping";
     int setgroups_fd = open(proc_path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
     if (setgroups_fd < 0 || write_all(setgroups_fd, "deny\n", 5U) < 0 || close(setgroups_fd) < 0) {
+        int saved = errno;
         close(map_go[1]); close(session_ready[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
-        cleanup_pins(pin_dir); close(master); return -1;
+        cleanup_pins(pin_dir); close(master); errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
     }
+    stage = "release namespace launcher";
     install_map(launcher, "uid_map", uid_map);
     install_map(launcher, "gid_map", gid_map);
     if (write_all(map_go[1], "G", 1U) < 0) {
+        int saved = errno;
         close(map_go[1]); close(session_ready[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
-        cleanup_pins(pin_dir); close(master); return -1;
+        cleanup_pins(pin_dir); close(master); errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
     }
     close(map_go[1]);
+    stage = "wait for isolated user shell";
     int ready_result = wait_byte(session_ready[0], 'R', 15000);
     close(session_ready[0]);
     if (ready_result < 0) {
+        int saved = errno;
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
-        cleanup_pins(pin_dir); close(master); return -1;
+        cleanup_pins(pin_dir); close(master); errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
     }
+    stage = "announce session to login frontend";
     if (write_all(socket_fd, "OK\n", 3U) < 0) {
+        int saved = errno;
         (void)kill(launcher, SIGTERM);
         (void)waitpid(launcher, NULL, 0);
-        cleanup_pins(pin_dir); close(master); return -1;
+        cleanup_pins(pin_dir); close(master); errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
     }
+    stage = "relay session terminal";
     int relay_result = relay_session(socket_fd, master, tty_fd, launcher);
     if (relay_result != 0) (void)kill(launcher, SIGTERM);
+    int relay_errno = errno;
     int status = 0;
     while (waitpid(launcher, &status, 0) < 0 && errno == EINTR) {}
     cleanup_pins(pin_dir);
     close(master);
+    if (relay_result < 0) {
+        errno = relay_errno;
+        return format_launch_error(launch_error, launch_error_size, stage);
+    }
     return relay_result;
 fail:
-    if (slave >= 0) close(slave);
-    if (master >= 0) close(master);
-    return -1;
+    {
+        int saved = errno;
+        if (slave >= 0) close(slave);
+        if (master >= 0) close(master);
+        errno = saved;
+    }
+    return format_launch_error(launch_error, launch_error_size, stage);
 }
 
 static int handle_session_client(int fd) {
@@ -1207,11 +1266,17 @@ static int handle_session_client(int fd) {
             (void)write_all(fd, response, (size_t)length);
         return -1;
     }
+    char launch_error[256] = {0};
     int result = create_namespace_session(fd, tty_fd, &session, term,
-                                          rootfd, homefd, shell);
+                                          rootfd, homefd, shell, launch_error,
+                                          sizeof(launch_error));
     close(rootfd); close(homefd); close(tty_fd);
     if (result < 0) {
-        (void)write_all(fd, "ERROR launch\n", 13U);
+        char response[320];
+        int length = snprintf(response, sizeof(response), "ERROR launch: %s\n",
+                              launch_error[0] ? launch_error : strerror(errno));
+        if (length > 0 && (size_t)length < sizeof(response))
+            (void)write_all(fd, response, (size_t)length);
         return -1;
     }
     return 0;
