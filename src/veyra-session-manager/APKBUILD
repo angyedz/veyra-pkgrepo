@@ -1,0 +1,31 @@
+pkgname=veyra-session-manager
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="PAM login frontend and broker for isolated Veyra TTY sessions"
+url="https://github.com/angyedz/Veyra-Linux"
+arch="x86_64"
+license="MIT"
+depends="linux-pam veyra-session-auth veyra-user-root-provisioner openrc"
+makedepends="build-base linux-pam-dev"
+options="!check"
+source=""
+builddir="$srcdir"
+
+build() {
+    ${CC:-gcc} ${CPPFLAGS:-} ${CFLAGS:-} -O2 -std=c11 -D_FORTIFY_SOURCE=2 \
+        -fPIE -pie -Wall -Wextra -Werror \
+        -Wl,-z,relro,-z,now \
+        -o "$builddir/veyra-session-manager" \
+        "$startdir/veyra-session-manager.c" -lpam
+}
+
+package() {
+    install -Dm755 "$builddir/veyra-session-manager" \
+        "$pkgdir/usr/sbin/veyra-session-manager"
+    install -Dm755 "$builddir/veyra-session-manager" \
+        "$pkgdir/usr/sbin/veyra-login"
+    install -Dm755 "$startdir/veyra-session-manager.initd" \
+        "$pkgdir/etc/init.d/veyra-session-manager"
+    install -Dm644 "$startdir/README.md" \
+        "$pkgdir/usr/share/doc/veyra-session-manager/README.md"
+}

@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+description="Veyra isolated user TTY session manager"
+command="/usr/sbin/veyra-session-manager"
+command_args="serve"
+command_background="yes"
+command_user="root:root"
+pidfile="/run/veyra-session-manager.pid"
+
+depend() {
+	need localmount
+	after bootmisc
+}
+
+start_pre() {
+	checkpath --directory --mode 0755 --owner root:root /run/veyra-session-manager
+}

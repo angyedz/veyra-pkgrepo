@@ -33,6 +33,7 @@ jobs:
           sh tests/test-account-registry.sh
           sh tests/test-user-root-provisioner.sh
           sh tests/test-session-auth.sh
+          sh tests/test-session-manager.sh
       - name: Test vpkg
         run: cd distro-source/vpkg && go test ./... && go vet ./...
       - name: Configure isolated builder and signing
