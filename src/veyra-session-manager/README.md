@@ -40,7 +40,13 @@ SDDM, or SSH stacks here.
 
 This is a TTY-only experimental launch path. It does not start OpenRC inside
 the user root, start a graphical desktop, integrate with a display manager, or
-implement the separate system-root password bridge. Before enabling it by
-default, a full QEMU login/logout, disconnect, concurrent-account, and
-manager-restart run must pass, followed by independent security review. Until
-then, the feature remains opt-in.
+implement the separate system-root password bridge. The package CI QEMU test
+now exercises two ordinary system accounts concurrently in distinct mapped
+roots, rejects a wrong password, checks that the host block device and manager
+socket are hidden and inner `sudo` is denied, and covers client disconnect,
+manager restart, logout, relogin, and persistent per-account homes. This tests
+the package launch path; it does not prove an installed Veyra image or real
+hardware integration. The OpenRC service remains disabled by default and no
+getty is redirected automatically. Independent security review and installed
+image/display-manager integration are still required before this can become a
+default login path.
