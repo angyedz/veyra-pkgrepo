@@ -956,7 +956,11 @@ static void namespace_launcher(struct launcher_args *args) {
         child_fail("create isolated namespaces");
     pid_t pid1 = fork();
     if (pid1 < 0) child_fail("start namespace process");
-    if (pid1 == 0) inner_session(args);
+    if (pid1 == 0) {
+        struct launcher_args inner_args = *args;
+        inner_args.expected_parent = getppid();
+        inner_session(&inner_args);
+    }
     close(args->tty_slave);
     close(args->rootfd);
     if (args->homefd >= 0) close(args->homefd);
