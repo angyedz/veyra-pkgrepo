@@ -11,9 +11,11 @@ command -v abuild-sign >/dev/null || { echo 'Missing abuild-sign' >&2; exit 1; }
 [ -r "$PACKAGER_PRIVKEY" ] || { echo 'Signing key missing' >&2; exit 1; }
 for dir in "$root"/src/*; do
     [ -f "$dir/APKBUILD" ] || continue
-    case "${dir##*/}" in veyra-meta) continue ;; esac
+    # Build local dependents after providers even when their names sort later.
+    case "${dir##*/}" in veyra-meta|veyra-session-manager) continue ;; esac
     (cd "$dir" && abuild -r)
 done
+(cd "$root/src/veyra-session-manager" && abuild -r)
 (cd "$root/src/veyra-meta" && abuild -r)
 out="$root/packages/repo/x86_64"
 mkdir -p "$out"
