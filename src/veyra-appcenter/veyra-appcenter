@@ -17,7 +17,9 @@ if not (ASSET_DIR / "main.qml").is_file():
     ASSET_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ASSET_DIR))
 from backend import (parse_apk_search, parse_apk_installed, parse_nix_search,
-                     parse_nix_profile, nix_cli, validate_name, featured_packages)
+                     parse_nix_profile, parse_flatpak_list, nix_cli, validate_name,
+                     validate_flatpak_id, featured_packages,
+                     featured_flatpak_packages, FLATHUB_URL)
 
 
 class CommandThread(QThread):
@@ -67,6 +69,10 @@ class PackageController(QObject):
     def nixAvailable(self):
         return shutil.which("nix") is not None
 
+    @pyqtProperty(bool, constant=True)
+    def flatpakAvailable(self):
+        return shutil.which("flatpak") is not None
+
     def set_status(self, message):
         self._status = message
         self.statusChanged.emit()
@@ -102,17 +108,23 @@ class PackageController(QObject):
         self._worker.finished_command.connect(handle)
         self._worker.start()
 
-    @pyqtSlot(str)
-    def featured(self, category):
+    @pyqtSlot(str, str)
+    def featured(self, category, source):
         if self._busy:
             return
         try:
-            self._results = featured_packages(category)
+            if source == "flatpak":
+                self._results = featured_flatpak_packages(category)
+            else:
+                self._results = featured_packages(category)
         except ValueError as error:
             self.set_status(str(error))
             return
         self.changed.emit()
-        self.set_status("Popular applications from the Alpine repositories")
+        if source == "flatpak":
+            self.set_status("Popular per-user applications from Flathub")
+        else:
+            self.set_status("Popular applications from the Alpine repositories")
 
     @pyqtSlot(str, str)
     def search(self, query, source):
@@ -122,6 +134,13 @@ class PackageController(QObject):
             return
         if source == "apk":
             self.start(["apk", "search", "-v", "--", query], parse_apk_search)
+        elif source == "flatpak" and self.flatpakAvailable:
+            remote = ["flatpak", "remote-add", "--user", "--if-not-exists",
+                      "flathub", FLATHUB_URL]
+            search = ["flatpak", "search", "--user",
+                      "--columns=application,name,description", "--", query]
+            self.start(remote, None,
+                       after=lambda: self.start(search, parse_flatpak_list))
         elif source == "nix" and self.nixAvailable:
             # Nix searches by regular expression; escape user input literally.
             self.start(nix_cli("search", "nixpkgs", re.escape(query), "--json"),
@@ -131,6 +150,10 @@ class PackageController(QObject):
     def installed(self, source):
         if source == "apk":
             self.start(["apk", "info"], parse_apk_installed)
+        elif source == "flatpak" and self.flatpakAvailable:
+            self.start(["flatpak", "list", "--user", "--app",
+                        "--columns=application,name,version"],
+                       lambda output: parse_flatpak_list(output, installed=True))
         elif source == "nix" and self.nixAvailable:
             self.start(nix_cli("profile", "list", "--json"), parse_nix_profile)
 
@@ -140,13 +163,25 @@ class PackageController(QObject):
             self.set_status("Unknown action.")
             return
         try:
-            validate_name(name)
+            if source == "flatpak":
+                validate_flatpak_id(name)
+            else:
+                validate_name(name)
         except ValueError as error:
             self.set_status(str(error))
             return
         if source == "apk":
             argv = ["pkexec", "apk", "add" if action == "install" else "del",
                     "--", name]
+        elif source == "flatpak" and self.flatpakAvailable:
+            if action == "install":
+                remote = ["flatpak", "remote-add", "--user", "--if-not-exists",
+                          "flathub", FLATHUB_URL]
+                install = ["flatpak", "install", "--user", "--assumeyes",
+                           "flathub", name]
+                self.start(remote, None, after=lambda: self.start(install, None))
+                return
+            argv = ["flatpak", "uninstall", "--user", "--assumeyes", name]
         elif source == "nix" and self.nixAvailable:
             if action == "install":
                 argv = nix_cli("profile", "install", "nixpkgs#" + name)
@@ -164,6 +199,11 @@ class PackageController(QObject):
     def refresh(self, source):
         if source == "apk":
             self.start(["pkexec", "apk", "update"], None)
+        elif source == "flatpak" and self.flatpakAvailable:
+            remote = ["flatpak", "remote-add", "--user", "--if-not-exists",
+                      "flathub", FLATHUB_URL]
+            refresh = ["flatpak", "update", "--user", "--appstream", "flathub"]
+            self.start(remote, None, after=lambda: self.start(refresh, None))
         elif source == "nix":
             self.set_status("Nix packages are queried from nixpkgs on each search.")
 

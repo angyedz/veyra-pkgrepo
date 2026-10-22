@@ -10,15 +10,20 @@ ApplicationWindow {
     minimumWidth: 720
     minimumHeight: 480
     title: "Veyra AppCenter"
-    Component.onCompleted: { console.log("VEYRA_QML_READY"); backend.featured("All") }
+    Component.onCompleted: { console.log("VEYRA_QML_READY"); backend.featured("All", "apk") }
     color: "#10141e"
     property bool installedMode: false
 
-    function currentSource() { return sourceBox.currentIndex === 0 ? "apk" : "nix" }
+    function currentSource() {
+        if (sourceBox.currentIndex === 0) return "apk"
+        if (backend.flatpakAvailable) return sourceBox.currentIndex === 1 ? "flatpak" : "nix"
+        return "nix"
+    }
     function runSearch() {
         installedMode = false
-        if (searchBox.text.trim().length === 0 && currentSource() === "apk")
-            backend.featured(categoryBox.currentText)
+        if (searchBox.text.trim().length === 0 &&
+                (currentSource() === "apk" || currentSource() === "flatpak"))
+            backend.featured(categoryBox.currentText, currentSource())
         else
             backend.search(searchBox.text, currentSource())
     }
@@ -27,7 +32,7 @@ ApplicationWindow {
         sourceBox.currentIndex = 0
         searchBox.text = ""
         categoryBox.currentIndex = 0
-        backend.featured("All")
+        backend.featured("All", currentSource())
     }
     function showInstalled() {
         installedMode = true
@@ -99,14 +104,18 @@ ApplicationWindow {
                 ComboBox {
                     id: sourceBox
                     Layout.fillWidth: true
-                    model: backend.nixAvailable ? ["Alpine / Veyra", "Nix packages"] : ["Alpine / Veyra"]
+                    model: backend.flatpakAvailable
+                           ? (backend.nixAvailable
+                              ? ["Alpine / Veyra", "Flatpak / Flathub", "Nix packages"]
+                              : ["Alpine / Veyra", "Flatpak / Flathub"])
+                           : (backend.nixAvailable ? ["Alpine / Veyra", "Nix packages"] : ["Alpine / Veyra"])
                     onActivated: {
                         if (window.installedMode) window.showInstalled()
                         else window.runSearch()
                     }
                 }
                 Label {
-                    text: "APK packages are verified\nusing trusted signing keys.\nNix runs as your user."
+                    text: "APK packages use trusted\nsigning keys. Flatpak apps\ninstall only for your user."
                     color: "#8c9ab1"
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
@@ -174,11 +183,12 @@ ApplicationWindow {
                 ComboBox {
                     id: categoryBox
                     Layout.preferredWidth: 210
-                    enabled: !backend.busy && !installedMode && window.currentSource() === "apk"
+                    enabled: !backend.busy && !installedMode &&
+                             (window.currentSource() === "apk" || window.currentSource() === "flatpak")
                     model: ["All", "Internet", "Office", "Media", "Creative", "Utilities"]
                     onActivated: {
                         searchBox.text = ""
-                        backend.featured(currentText)
+                        backend.featured(currentText, window.currentSource())
                     }
                 }
                 Label {

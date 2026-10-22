@@ -20,7 +20,11 @@ single Git commit, using this repo's built-in GITHUB_TOKEN (contents:write).
 Local Alpine build requires alpine-sdk, go, git, an abuild signing key, and
 the Veyra-Linux clone at distro-source/. Run: sh scripts/build.sh.
 
-Veyra AppCenter is a Qt Quick interface for APK and optional user-scoped Nix.
-Alpine Stable and nixpkgs supply the main catalogs. glenv is a glibc runtime
+Veyra AppCenter is a Qt Quick interface for signed APK packages, optional
+user-scoped Flatpak applications from Flathub, and optional user-scoped Nix.
+Alpine Stable and Flathub supply the application catalogs. Flatpak applications
+are installed into the current account's home; the system APK lane remains
+administrator-managed in Veyra AppCenter. AppCenter supplies both the Alpine
+APK catalog and per-user Flathub installs. glenv is a glibc runtime
 compatibility environment, not a package manager. The GitHub raw path is a
 development mirror and needs CDN validation for production use.
