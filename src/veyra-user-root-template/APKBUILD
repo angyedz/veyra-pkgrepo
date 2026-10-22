@@ -21,6 +21,9 @@ package() {
 	# Keep the template self-contained and signed, but do not run Alpine package
 	# scripts in the host build environment or as part of a future login.
 	apk --root "$root" --no-cache --no-scripts add sudo
+	# abuild rejects setuid files. The system-side provisioner grants the bit
+	# only after assigning the account's mapped ownership to its private root.
+	chmod u-s "$root/usr/bin/sudo"
 
 	[ -x "$root/sbin/init" ] || return 1
 	[ -x "$root/bin/ash" ] || return 1

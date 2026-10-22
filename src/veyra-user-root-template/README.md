@@ -7,7 +7,9 @@ repositories so user environments can manage their own packages independently.
 
 The template includes `/sbin/init`, BusyBox `ash`, a `veyrauser` account at
 UID/GID 1000, and a separate home skeleton. All template password fields are
-locked. The default sudo policy grants no privilege to `veyrauser`; the
+locked. Its `sudo` binary is not setuid in the package; the system-side
+provisioner enables it only after assigning mapped ownership to an individual
+root. The default sudo policy grants no privilege to `veyrauser`; the
 provisioner also rejects active passwordless sudo rules. No host account
 password verifier is copied into an isolated root.
 
