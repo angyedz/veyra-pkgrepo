@@ -65,6 +65,33 @@ jobs:
           cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
       - name: Build package snapshot
         run: su builder -c "cd '$GITHUB_WORKSPACE' && sh scripts/build.sh"
+      - name: Build Alpine guest and exercise PAM session manager in QEMU
+        run: |
+          set -eu
+          apk add --no-cache e2fsprogs linux-lts mkinitfs py3-pexpect qemu-system-x86_64 shadow
+          qemu_dir=$(mktemp -d /tmp/veyra-session-manager-qemu.XXXXXX)
+          serial_log="$GITHUB_WORKSPACE/session-manager-qemu-serial.log"
+          trap 'rm -rf -- "$qemu_dir"' EXIT HUP INT TERM
+          sh tests/build-session-manager-qemu.sh "$qemu_dir"
+          python3 tests/test-session-manager-qemu.py \
+            "$qemu_dir/kernel" \
+            "$qemu_dir/initramfs" \
+            "$qemu_dir/system.raw" \
+            "$qemu_dir/user-store.raw" \
+            --log "$serial_log"
+      - name: Print QEMU serial diagnostics
+        if: failure()
+        run: |
+          test ! -s "$GITHUB_WORKSPACE/session-manager-qemu-serial.log" || \
+            tail -n 240 "$GITHUB_WORKSPACE/session-manager-qemu-serial.log"
+      - name: Save QEMU serial proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veyra-session-manager-qemu-serial
+          path: session-manager-qemu-serial.log
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Validate artifact count and index
         run: |
           set -eu

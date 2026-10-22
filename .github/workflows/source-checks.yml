@@ -42,6 +42,11 @@ jobs:
           test -s branding/fastfetch/logo.txt
       - name: Unit tests for package parsing and command validation
         run: python3 -m unittest discover -s tests -v
+      - name: Syntax-check PAM session QEMU harness
+        run: |
+          set -eu
+          sh -n tests/build-session-manager-qemu.sh
+          python3 -m py_compile tests/test-session-manager-qemu.py
       - name: Check GUI dependencies exist in Alpine repositories
         run: |
           apk update
