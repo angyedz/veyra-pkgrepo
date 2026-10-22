@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -29,6 +30,7 @@
 #else
 #define IDLE_TIMEOUT_SECONDS 900
 #endif
+#define LOGIN_INPUT_TIMEOUT_SECONDS 300U
 #define MAX_USERNAME 64U
 #define MAX_SECRET 1024U
 #define INPUT_BUFFER_SIZE 4096U
@@ -119,7 +121,56 @@ static int read_line(int fd, char *buffer, size_t capacity, bool secret) {
 
     size_t used = 0U;
     bool overflow = false;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) < 0) {
+        if (restore)
+            (void)tcsetattr(fd, TCSAFLUSH, &original);
+        wipe_memory(buffer, capacity);
+        return -1;
+    }
+    deadline.tv_sec += (time_t)LOGIN_INPUT_TIMEOUT_SECONDS;
     for (;;) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+            if (restore)
+                (void)tcsetattr(fd, TCSAFLUSH, &original);
+            wipe_memory(buffer, capacity);
+            return -1;
+        }
+        const int64_t nanoseconds_left =
+            ((int64_t)deadline.tv_sec - (int64_t)now.tv_sec) * 1000000000LL +
+            (int64_t)deadline.tv_nsec - (int64_t)now.tv_nsec;
+        int64_t milliseconds_left = nanoseconds_left / 1000000LL;
+        if (milliseconds_left <= 0) {
+            if (restore)
+                (void)tcsetattr(fd, TCSAFLUSH, &original);
+            wipe_memory(buffer, capacity);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (milliseconds_left > INT_MAX)
+            milliseconds_left = INT_MAX;
+        struct pollfd input = { .fd = fd, .events = POLLIN };
+        int poll_result;
+        do {
+            poll_result = poll(&input, 1U, (int)milliseconds_left);
+        } while (poll_result < 0 && errno == EINTR && caught_signal == 0);
+        if (poll_result == 0) {
+            if (restore)
+                (void)tcsetattr(fd, TCSAFLUSH, &original);
+            wipe_memory(buffer, capacity);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (poll_result < 0 ||
+            (input.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            if (restore)
+                (void)tcsetattr(fd, TCSAFLUSH, &original);
+            wipe_memory(buffer, capacity);
+            if (poll_result >= 0)
+                errno = EIO;
+            return -1;
+        }
         unsigned char byte;
         const ssize_t amount = read(fd, &byte, 1U);
         if (amount < 0) {

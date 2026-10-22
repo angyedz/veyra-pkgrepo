@@ -33,8 +33,6 @@ package() {
 		"$pkgdir/etc/pam.d/veyra-root-bridge"
 	install -Dm644 "$startdir/README.md" \
 		"$pkgdir/usr/share/doc/veyra-root-bridge/README.md"
-	install -Dm644 "$startdir/tty9-inittab.example" \
-		"$pkgdir/usr/share/doc/veyra-root-bridge/tty9-inittab.example"
 	install -d -m0755 "$pkgdir/etc/veyra"
 	install -m0600 /dev/null "$pkgdir/etc/veyra/root-admins"
 	install -d -m0755 "$pkgdir/var/log/veyra"

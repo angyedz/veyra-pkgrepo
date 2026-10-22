@@ -5,7 +5,7 @@ pkgdesc="Sealed Alpine x86_64 root template for isolated Veyra user sessions"
 url="https://github.com/angyedz/veyra-pkgrepo"
 arch="x86_64"
 license="GPL-2.0-only MIT BSD-2-Clause BSD-3-Clause ISC"
-makedepends="apk-tools"
+makedepends="apk-tools build-base"
 source="alpine-minirootfs-$pkgver-x86_64.tar.gz::https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-$pkgver-x86_64.tar.gz"
 sha512sums="
 3d3ce208455c9fa455a85e0c4f1695a292776dccbe8db302b0934f84c0537b2ca201a56c0c150b421f631e54c21bc35a37668e8b33522e844803998692bbc645  alpine-minirootfs-$pkgver-x86_64.tar.gz
@@ -17,6 +17,12 @@ package() {
 	local root="$pkgdir/usr/share/veyra/user-root-template"
 	mkdir -p "$root"
 	cp -a "$builddir/." "$root/"
+	${CC:-gcc} ${CPPFLAGS:-} ${CFLAGS:-} -O2 -std=c11 -D_FORTIFY_SOURCE=2 \
+		-fPIE -pie -Wall -Wextra -Werror -Wl,-z,relro,-z,now \
+		-o "$builddir/veyra-root-request" \
+		"$startdir/veyra-root-request.c"
+	install -Dm755 "$builddir/veyra-root-request" \
+		"$root/usr/bin/veyra-root-request"
 
 	# Keep the template self-contained and signed, but do not run Alpine package
 	# scripts in the host build environment or as part of a future login.
@@ -31,6 +37,7 @@ package() {
 	[ -x "$root/sbin/init" ] || return 1
 	[ -x "$root/bin/ash" ] || return 1
 	[ -f "$root/usr/bin/sudo" ] || return 1
+	[ -x "$root/usr/bin/veyra-root-request" ] || return 1
 	[ -f "$root/etc/passwd" ] && [ -f "$root/etc/shadow" ] || return 1
 	[ -f "$root/etc/group" ] && [ -f "$root/etc/sudoers" ] || return 1
 	[ ! -L "$root/home" ] || return 1

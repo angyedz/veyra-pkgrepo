@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/random.h>
@@ -28,6 +29,7 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/vt.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -71,6 +73,11 @@ struct veyra_open_how {
 #define RELAY_BUFFER 65536U
 #define MAX_SESSION_WORKERS 32U
 #define REQUEST_TIMEOUT_MS 10000
+#define ROOT_BRIDGE_TTY "/dev/tty9"
+#define ROOT_BRIDGE_CONSOLE "/usr/sbin/veyra-root-console"
+#define ROOT_BRIDGE_LOCK_PATH RUN_DIR "/root-bridge.lock"
+#define ROOT_BRIDGE_COOLDOWN_SECONDS 60
+#define ROOT_BRIDGE_PACKET "ROOTREQ1"
 
 struct authorized_session {
     char account[MAX_ACCOUNT + 1U];
@@ -528,17 +535,32 @@ static int validate_rootfs(int rootfd, int homefd,
     return 0;
 }
 
-static int close_child_fds(int keep_fd) {
+static int close_child_fds(int keep_fd, int second_keep_fd) {
 #ifdef SYS_close_range
-    if (keep_fd < 3) {
-        if (syscall(SYS_close_range, 3U, UINT_MAX, 0U) == 0) return 0;
-    } else if (keep_fd == 3) {
-        if (syscall(SYS_close_range, 4U, UINT_MAX, 0U) == 0) return 0;
-    } else if (syscall(SYS_close_range, 3U, (unsigned)keep_fd - 1U, 0U) == 0 &&
-               syscall(SYS_close_range, (unsigned)keep_fd + 1U,
-                       UINT_MAX, 0U) == 0) {
-        return 0;
+    unsigned int keep[2];
+    size_t keep_count = 0U;
+    if (keep_fd >= 3)
+        keep[keep_count++] = (unsigned int)keep_fd;
+    if (second_keep_fd >= 3 && second_keep_fd != keep_fd)
+        keep[keep_count++] = (unsigned int)second_keep_fd;
+    if (keep_count == 2U && keep[0] > keep[1]) {
+        unsigned int temporary = keep[0];
+        keep[0] = keep[1];
+        keep[1] = temporary;
     }
+    unsigned int first = 3U;
+    int range_status = 0;
+    for (size_t index = 0U; index < keep_count; ++index) {
+        if (keep[index] > first &&
+            syscall(SYS_close_range, first, keep[index] - 1U, 0U) < 0) {
+            range_status = -1;
+            break;
+        }
+        first = keep[index] + 1U;
+    }
+    if (range_status == 0 &&
+        syscall(SYS_close_range, first, UINT_MAX, 0U) == 0)
+        return 0;
 #endif
     struct rlimit limit;
     if (getrlimit(RLIMIT_NOFILE, &limit) < 0) return -1;
@@ -546,7 +568,8 @@ static int close_child_fds(int keep_fd) {
     if (upper == RLIM_INFINITY || upper > (rlim_t)INT_MAX)
         upper = (rlim_t)INT_MAX;
     for (rlim_t fd = 3U; fd < upper; ++fd)
-        if ((int)fd != keep_fd) (void)close((int)fd);
+        if ((int)fd != keep_fd && (int)fd != second_keep_fd)
+            (void)close((int)fd);
     return 0;
 }
 
@@ -572,7 +595,7 @@ static int run_capture(const char *path, char *const argv[],
             _exit(126);
         if (nullfd > STDERR_FILENO) close(nullfd);
         close(pipefd[1]);
-        if (close_child_fds(-1) < 0) _exit(126);
+        if (close_child_fds(-1, -1) < 0) _exit(126);
         char *const envp[] = { (char *)"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
                                (char *)"LC_ALL=C", NULL };
         execve(path, argv, envp);
@@ -876,6 +899,7 @@ struct launcher_args {
     int homefd;
     int tty_slave;
     int session_ready_write;
+    int bridge_request_fd;
     uint32_t uid_base;
     pid_t expected_parent;
     char account[MAX_ACCOUNT + 1U];
@@ -955,8 +979,19 @@ static void inner_session(struct launcher_args *args) {
         getppid() != args->expected_parent)
         child_fail("drop to the user account");
     (void)prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-    if (close_child_fds(args->session_ready_write) < 0)
+
+    int ready_fd = fcntl(args->session_ready_write, F_DUPFD_CLOEXEC, 10);
+    int bridge_fd = fcntl(args->bridge_request_fd, F_DUPFD_CLOEXEC, 11);
+    if (ready_fd < 0 || bridge_fd < 0)
+        child_fail("prepare isolated session control descriptors");
+    startup_error_fd = ready_fd;
+    close(args->session_ready_write);
+    close(args->bridge_request_fd);
+    if (dup2(bridge_fd, 3) < 0 ||
+        fcntl(3, F_SETFD, 0) < 0 ||
+        close_child_fds(ready_fd, 3) < 0)
         child_fail("close inherited system descriptors");
+    close(bridge_fd);
     char argv0[PATH_MAX];
     const char *base = strrchr(args->shell, '/');
     base = base == NULL ? args->shell : base + 1;
@@ -974,9 +1009,9 @@ static void inner_session(struct launcher_args *args) {
     char *const envp[] = { home_env, user_env, logname_env, shell_env,
                            term_env, (char *)"PATH=/usr/local/bin:/usr/bin:/bin",
                            (char *)"TMPDIR=/tmp", (char *)"LANG=C.UTF-8", NULL };
-    if (write_all(args->session_ready_write, "R", 1U) < 0)
+    if (write_all(ready_fd, "R", 1U) < 0)
         child_fail("signal session readiness");
-    close(args->session_ready_write);
+    close(ready_fd);
     startup_error_fd = -1;
     execve(args->shell, shell_argv, envp);
     child_fail("start user login shell");
@@ -1012,6 +1047,8 @@ static void namespace_launcher(struct launcher_args *args) {
         inner_args.expected_parent = getppid();
         inner_session(&inner_args);
     }
+    if (args->bridge_request_fd >= 0)
+        close(args->bridge_request_fd);
     close(args->tty_slave);
     close(args->rootfd);
     if (args->homefd >= 0) close(args->homefd);
@@ -1088,17 +1125,359 @@ static int queue_write(int fd, struct pending_buffer *buffer) {
     return 0;
 }
 
-static int relay_session(int socket_fd, int master_fd, int tty_fd, pid_t launcher) {
-    if (set_nonblock(socket_fd) < 0 || set_nonblock(master_fd) < 0) return -1;
+struct root_bridge_console {
+    pid_t pid;
+    int pidfd;
+    int lockfd;
+    unsigned int previous_vt;
+};
+
+static int no_pam_prompts(int count, const struct pam_message **messages,
+                          struct pam_response **responses, void *data) {
+    (void)count;
+    (void)messages;
+    (void)responses;
+    (void)data;
+    return PAM_CONV_ERR;
+}
+
+static int root_bridge_account_allowed(const char *account) {
+    struct pam_conv conversation = { .conv = no_pam_prompts,
+                                    .appdata_ptr = NULL };
+    pam_handle_t *pamh = NULL;
+    int status = pam_start("veyra-root-bridge", account, &conversation, &pamh);
+    if (status == PAM_SUCCESS)
+        status = pam_set_item(pamh, PAM_TTY, ROOT_BRIDGE_TTY);
+    if (status == PAM_SUCCESS)
+        status = pam_acct_mgmt(pamh, 0);
+    if (pamh != NULL)
+        (void)pam_end(pamh, status);
+    return status == PAM_SUCCESS;
+}
+
+static int acquire_root_bridge_lock(void) {
+    const int fd = open(ROOT_BRIDGE_LOCK_PATH,
+                        O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+                        0600);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != 0U ||
+        st.st_gid != 0U || st.st_nlink != 1 || (st.st_mode & 0777) != 0600) {
+        close(fd);
+        errno = EPERM;
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        close(fd);
+        return -2;
+    }
+
+    char previous_text[32] = {0};
+    const ssize_t previous_length = pread(fd, previous_text,
+                                           sizeof(previous_text) - 1U, 0);
+    if (previous_length < 0) {
+        close(fd);
+        return -1;
+    }
+    uint64_t previous = 0U;
+    if (previous_length > 0) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(previous_text, &end, 10);
+        if (errno != 0 || end == previous_text || *end != '\n' ||
+            end[1] != '\0') {
+            close(fd);
+            errno = EINVAL;
+            return -1;
+        }
+        previous = (uint64_t)parsed;
+    }
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0 || now.tv_sec < 0) {
+        close(fd);
+        return -1;
+    }
+    const uint64_t current = (uint64_t)now.tv_sec;
+    if (previous != 0U &&
+        (current < previous || current - previous < ROOT_BRIDGE_COOLDOWN_SECONDS)) {
+        close(fd);
+        errno = EAGAIN;
+        return -2;
+    }
+    char current_text[32];
+    const int current_length = snprintf(current_text, sizeof(current_text),
+                                        "%llu\n",
+                                        (unsigned long long)current);
+    if (current_length < 0 || (size_t)current_length >= sizeof(current_text) ||
+        ftruncate(fd, 0) < 0 ||
+        pwrite(fd, current_text, (size_t)current_length, 0) != current_length ||
+        fsync(fd) < 0) {
+        close(fd);
+        errno = EIO;
+        return -1;
+    }
+    return fd;
+}
+
+static int root_bridge_console_tty(int tty_fd,
+                                   const struct authorized_session *session,
+                                   struct vt_stat *state) {
+    struct stat current_tty;
+    if (session->tty_major != 4U || session->tty_minor == 0U ||
+        session->tty_minor > 63U || fstat(tty_fd, &current_tty) < 0 ||
+        !S_ISCHR(current_tty.st_mode) || major(current_tty.st_rdev) != 4U ||
+        minor(current_tty.st_rdev) != session->tty_minor ||
+        ioctl(tty_fd, VT_GETSTATE, state) < 0 ||
+        state->v_active != session->tty_minor ||
+        (state->v_state & (1U << 8U)) != 0U) {
+        errno = ENOTTY;
+        return -1;
+    }
+    return 0;
+}
+
+static void restore_virtual_terminal(int tty_fd, unsigned int previous_vt) {
+    struct vt_stat state;
+    if (ioctl(tty_fd, VT_GETSTATE, &state) == 0 && state.v_active == 9U) {
+        if (ioctl(tty_fd, VT_ACTIVATE, (int)previous_vt) == 0)
+            (void)ioctl(tty_fd, VT_WAITACTIVE, (int)previous_vt);
+    }
+    (void)ioctl(tty_fd, VT_DISALLOCATE, 9);
+}
+
+static int wait_for_root_console_exec(int fd) {
+    struct pollfd descriptor = { .fd = fd, .events = POLLIN };
+    int ready;
+    do {
+        ready = poll(&descriptor, 1U, 5000);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0) {
+        if (ready == 0)
+            errno = ETIMEDOUT;
+        return -1;
+    }
+    char failure;
+    ssize_t amount;
+    do {
+        amount = read(fd, &failure, sizeof(failure));
+    } while (amount < 0 && errno == EINTR);
+    if (amount == 0)
+        return 0;
+    if (amount > 0)
+        errno = ENOEXEC;
+    return -1;
+}
+
+static int start_root_bridge_console(
+    int tty_fd, const struct authorized_session *session,
+    struct root_bridge_console *console) {
+    if (!root_bridge_account_allowed(session->account))
+        return 1;
+
+    struct vt_stat state;
+    if (root_bridge_console_tty(tty_fd, session, &state) < 0)
+        return -1;
+    const int lockfd = acquire_root_bridge_lock();
+    if (lockfd == -2)
+        return 2;
+    if (lockfd < 0)
+        return -1;
+
+    const int console_tty = open(ROOT_BRIDGE_TTY,
+                                 O_RDWR | O_NOCTTY | O_CLOEXEC | O_NOFOLLOW);
+    if (console_tty < 0) {
+        close(lockfd);
+        return -1;
+    }
+    struct stat console_stat;
+    if (fstat(console_tty, &console_stat) < 0 ||
+        !S_ISCHR(console_stat.st_mode) || major(console_stat.st_rdev) != 4U ||
+        minor(console_stat.st_rdev) != 9U) {
+        close(console_tty);
+        close(lockfd);
+        errno = ENODEV;
+        return -1;
+    }
+    int exec_status[2] = {-1, -1};
+    if (pipe2(exec_status, O_CLOEXEC) < 0) {
+        close(console_tty);
+        close(lockfd);
+        return -1;
+    }
+    if (ioctl(tty_fd, VT_ACTIVATE, 9) < 0) {
+        close(exec_status[0]);
+        close(exec_status[1]);
+        close(console_tty);
+        close(lockfd);
+        return -1;
+    }
+    if (ioctl(tty_fd, VT_WAITACTIVE, 9) < 0) {
+        int saved = errno;
+        restore_virtual_terminal(tty_fd, state.v_active);
+        close(exec_status[0]);
+        close(exec_status[1]);
+        close(console_tty);
+        close(lockfd);
+        errno = saved;
+        return -1;
+    }
+
+    const pid_t expected_parent = getpid();
+    const pid_t child = fork();
+    if (child < 0) {
+        int saved = errno;
+        restore_virtual_terminal(tty_fd, state.v_active);
+        close(exec_status[0]);
+        close(exec_status[1]);
+        close(console_tty);
+        close(lockfd);
+        errno = saved;
+        return -1;
+    }
+    if (child == 0) {
+        close(exec_status[0]);
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 ||
+            getppid() != expected_parent || setsid() < 0 ||
+            ioctl(console_tty, TIOCSCTTY, 0) < 0 ||
+            tcsetpgrp(console_tty, getpgrp()) < 0 ||
+            dup2(console_tty, STDIN_FILENO) < 0 ||
+            dup2(console_tty, STDOUT_FILENO) < 0 ||
+            dup2(console_tty, STDERR_FILENO) < 0) {
+            (void)write_all(exec_status[1], "E", 1U);
+            _exit(126);
+        }
+        if (console_tty > STDERR_FILENO)
+            close(console_tty);
+        if (close_child_fds(-1, exec_status[1]) < 0 || clearenv() < 0 ||
+            setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1) < 0 ||
+            setenv("TERM", "linux", 1) < 0) {
+            (void)write_all(exec_status[1], "E", 1U);
+            _exit(126);
+        }
+        char *const arguments[] = {
+            (char *)"veyra-root-console", (char *)"--", NULL
+        };
+        char *const environment[] = {
+            (char *)"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            (char *)"TERM=linux",
+            NULL,
+        };
+        execve(ROOT_BRIDGE_CONSOLE, arguments, environment);
+        (void)write_all(exec_status[1], "E", 1U);
+        _exit(127);
+    }
+    close(exec_status[1]);
+    if (wait_for_root_console_exec(exec_status[0]) < 0) {
+        int saved = errno;
+        close(exec_status[0]);
+        (void)kill(child, SIGTERM);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        restore_virtual_terminal(tty_fd, state.v_active);
+        close(console_tty);
+        close(lockfd);
+        errno = saved;
+        return -1;
+    }
+    close(exec_status[0]);
+    close(console_tty);
+    const int pidfd = (int)syscall(SYS_pidfd_open, child, 0U);
+    if (pidfd < 0) {
+        int saved = errno;
+        (void)kill(child, SIGTERM);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        restore_virtual_terminal(tty_fd, state.v_active);
+        close(lockfd);
+        errno = saved;
+        return -1;
+    }
+    console->pid = child;
+    console->pidfd = pidfd;
+    console->lockfd = lockfd;
+    console->previous_vt = state.v_active;
+    return 0;
+}
+
+static void finish_root_bridge_console(int tty_fd,
+                                       struct root_bridge_console *console,
+                                       int terminate) {
+    if (console->pid > 0) {
+        if (terminate)
+            (void)kill(console->pid, SIGTERM);
+        int status = 0;
+        int reaped = 0;
+        if (!terminate) {
+            while (waitpid(console->pid, &status, 0) < 0) {
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+            reaped = 1;
+        } else {
+            for (unsigned attempt = 0U; attempt < 50U; ++attempt) {
+                pid_t waited;
+                do {
+                    waited = waitpid(console->pid, &status, WNOHANG);
+                } while (waited < 0 && errno == EINTR);
+                if (waited == console->pid ||
+                    (waited < 0 && errno == ECHILD)) {
+                    reaped = 1;
+                    break;
+                }
+                if (waited < 0)
+                    break;
+                const struct timespec delay = {
+                    .tv_sec = 0, .tv_nsec = 100000000L
+                };
+                (void)nanosleep(&delay, NULL);
+            }
+            if (!reaped) {
+                (void)kill(console->pid, SIGKILL);
+                while (waitpid(console->pid, &status, 0) < 0 && errno == EINTR)
+                    ;
+            }
+        }
+    }
+    if (console->pidfd >= 0)
+        close(console->pidfd);
+    if (console->previous_vt > 0U)
+        restore_virtual_terminal(tty_fd, console->previous_vt);
+    if (console->lockfd >= 0)
+        close(console->lockfd);
+    memset(console, 0, sizeof(*console));
+    console->pidfd = -1;
+    console->lockfd = -1;
+}
+
+static void send_root_bridge_response(int fd, const char *response) {
+    (void)send(fd, response, strlen(response), MSG_NOSIGNAL | MSG_DONTWAIT);
+}
+
+static int relay_session(int socket_fd, int master_fd, int tty_fd,
+                         int bridge_fd,
+                         const struct authorized_session *session,
+                         pid_t launcher) {
+    if (set_nonblock(socket_fd) < 0 || set_nonblock(master_fd) < 0 ||
+        set_nonblock(bridge_fd) < 0)
+        return -1;
     int launcher_pidfd = (int)syscall(SYS_pidfd_open, launcher, 0U);
     if (launcher_pidfd < 0) return -1;
     struct pending_buffer input = {0}, output = {0};
     int socket_eof = 0, pty_eof = 0, result = 0;
+    int bridge_open = 1;
+    unsigned int bridge_requests = 0U;
+    struct root_bridge_console bridge_console = {
+        .pid = 0,
+        .pidfd = -1,
+        .lockfd = -1,
+        .previous_vt = 0U,
+    };
     struct winsize previous = {0};
     if (ioctl(tty_fd, TIOCGWINSZ, &previous) == 0)
         (void)ioctl(master_fd, TIOCSWINSZ, &previous);
     while (!socket_eof && (!pty_eof || output.length > 0U) && !stopping) {
-        struct pollfd fds[3];
+        struct pollfd fds[5];
         fds[0] = (struct pollfd){ .fd = socket_fd,
             .events = (short)((socket_eof || input.length == sizeof(input.bytes) ? 0 : POLLIN) |
                               (output.length > 0U ? POLLOUT : 0)) };
@@ -1106,8 +1485,14 @@ static int relay_session(int socket_fd, int master_fd, int tty_fd, pid_t launche
             .events = (short)((pty_eof || output.length == sizeof(output.bytes) ? 0 : POLLIN) |
                               (input.length > 0U ? POLLOUT : 0)) };
         fds[2] = (struct pollfd){ .fd = launcher_pidfd, .events = POLLIN };
+        fds[3] = (struct pollfd){ .fd = bridge_open ? bridge_fd : -1,
+                                 .events = bridge_open ? POLLIN : 0 };
+        fds[4] = (struct pollfd){
+            .fd = bridge_console.pid > 0 ? bridge_console.pidfd : -1,
+            .events = bridge_console.pid > 0 ? POLLIN : 0,
+        };
         int ready;
-        do { ready = poll(fds, 3U, 500); } while (ready < 0 && errno == EINTR);
+        do { ready = poll(fds, 5U, 500); } while (ready < 0 && errno == EINTR);
         if (ready < 0) { result = -1; break; }
         struct winsize current = {0};
         if (ioctl(tty_fd, TIOCGWINSZ, &current) == 0 &&
@@ -1139,8 +1524,55 @@ static int relay_session(int socket_fd, int master_fd, int tty_fd, pid_t launche
             close(launcher_pidfd);
             launcher_pidfd = -1;
         }
+        if (bridge_open && (fds[3].revents & POLLIN) != 0) {
+            unsigned char request[32];
+            const ssize_t amount = recv(bridge_fd, request, sizeof(request),
+                                        MSG_DONTWAIT | MSG_TRUNC);
+            if (amount == 0) {
+                bridge_open = 0;
+                close(bridge_fd);
+            } else if (amount < 0) {
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    bridge_open = 0;
+                    close(bridge_fd);
+                }
+            } else {
+                bridge_requests++;
+                if ((size_t)amount != sizeof(ROOT_BRIDGE_PACKET) - 1U ||
+                    memcmp(request, ROOT_BRIDGE_PACKET,
+                           sizeof(ROOT_BRIDGE_PACKET) - 1U) != 0) {
+                    send_root_bridge_response(bridge_fd, "INVALID");
+                } else if (bridge_requests > 4U ||
+                           bridge_console.pid > 0) {
+                    send_root_bridge_response(bridge_fd, "BUSY");
+                } else {
+                    const int bridge_status = start_root_bridge_console(
+                        tty_fd, session, &bridge_console);
+                    if (bridge_status == 1)
+                        send_root_bridge_response(bridge_fd, "DENIED");
+                    else if (bridge_status == 2)
+                        send_root_bridge_response(bridge_fd, "BUSY");
+                    else if (bridge_status < 0)
+                        send_root_bridge_response(bridge_fd, "UNAVAILABLE");
+                }
+            }
+        } else if (bridge_open &&
+                   (fds[3].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            bridge_open = 0;
+            close(bridge_fd);
+        }
+        if (bridge_console.pid > 0 &&
+            (fds[4].revents & POLLIN) != 0) {
+            finish_root_bridge_console(tty_fd, &bridge_console, 0);
+            if (bridge_open)
+                send_root_bridge_response(bridge_fd, "OK");
+        }
     }
     if (stopping) socket_eof = 1;
+    if (bridge_console.pid > 0)
+        finish_root_bridge_console(tty_fd, &bridge_console, 1);
+    if (bridge_open)
+        close(bridge_fd);
     if (launcher_pidfd >= 0) close(launcher_pidfd);
     if (socket_eof) return 1;
     return result;
@@ -1255,11 +1687,23 @@ static int create_namespace_session(int socket_fd, int tty_fd,
     }
     close(root_mount_fd); close(home_mount_fd);
     root_mount_fd = -1; home_mount_fd = -1;
-    stage = "create namespace synchronization pipes";
-    int map_ready[2], map_go[2], session_ready[2];
-    if (pipe2(map_ready, O_CLOEXEC) < 0 || pipe2(map_go, O_CLOEXEC) < 0 ||
+    stage = "create namespace synchronization pipes and bridge channel";
+    int map_ready[2] = {-1, -1};
+    int map_go[2] = {-1, -1};
+    int session_ready[2] = {-1, -1};
+    int bridge_channel[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+                   bridge_channel) < 0 ||
+        pipe2(map_ready, O_CLOEXEC) < 0 ||
+        pipe2(map_go, O_CLOEXEC) < 0 ||
         pipe2(session_ready, O_CLOEXEC) < 0) {
         int saved = errno;
+        for (size_t index = 0U; index < 2U; ++index) {
+            if (map_ready[index] >= 0) close(map_ready[index]);
+            if (map_go[index] >= 0) close(map_go[index]);
+            if (session_ready[index] >= 0) close(session_ready[index]);
+            if (bridge_channel[index] >= 0) close(bridge_channel[index]);
+        }
         cleanup_pins(pin_dir);
         errno = saved;
         goto fail;
@@ -1271,17 +1715,21 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         int saved = errno;
         close(map_ready[0]); close(map_ready[1]); close(map_go[0]); close(map_go[1]);
         close(session_ready[0]); close(session_ready[1]);
+        close(bridge_channel[0]); close(bridge_channel[1]);
         cleanup_pins(pin_dir);
         errno = saved;
         goto fail;
     }
     if (launcher == 0) {
         close(map_ready[0]); close(map_go[1]); close(session_ready[0]);
+        close(bridge_channel[0]);
         close(master);
         struct launcher_args args = {
             .map_ready_write = map_ready[1], .map_go_read = map_go[0],
             .rootfd = rootfd, .homefd = homefd, .tty_slave = slave,
-            .session_ready_write = session_ready[1], .uid_base = session->uid_base,
+            .session_ready_write = session_ready[1],
+            .bridge_request_fd = bridge_channel[1],
+            .uid_base = session->uid_base,
             .expected_parent = expected_parent,
         };
         memcpy(args.account, session->account, strlen(session->account) + 1U);
@@ -1291,11 +1739,13 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         namespace_launcher(&args);
         _exit(1);
     }
+    close(bridge_channel[1]);
     close(map_ready[1]); close(map_go[0]); close(session_ready[1]); close(slave);
     stage = "wait for mapped user namespace";
     if (wait_byte(map_ready[0], 'U', 10000) < 0) {
         int saved = errno;
         close(map_ready[0]); close(map_go[1]); close(session_ready[0]);
+        close(bridge_channel[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
         return format_launch_error(launch_error, launch_error_size, stage);
@@ -1307,7 +1757,7 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         snprintf(gid_map, sizeof(gid_map), "0 %u %u\n", session->uid_base, MAP_LENGTH) >= (int)sizeof(gid_map)) {
         errno = EOVERFLOW;
         int saved = errno;
-        close(map_go[1]); close(session_ready[0]);
+        close(map_go[1]); close(session_ready[0]); close(bridge_channel[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
         return format_launch_error(launch_error, launch_error_size, stage);
@@ -1316,7 +1766,7 @@ static int create_namespace_session(int socket_fd, int tty_fd,
     if (snprintf(proc_path, sizeof(proc_path), "/proc/%ld/setgroups", (long)launcher) >= (int)sizeof(proc_path)) {
         errno = EOVERFLOW;
         int saved = errno;
-        close(map_go[1]); close(session_ready[0]);
+        close(map_go[1]); close(session_ready[0]); close(bridge_channel[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
         return format_launch_error(launch_error, launch_error_size, stage);
@@ -1325,7 +1775,7 @@ static int create_namespace_session(int socket_fd, int tty_fd,
     int setgroups_fd = open(proc_path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
     if (setgroups_fd < 0 || write_all(setgroups_fd, "deny\n", 5U) < 0 || close(setgroups_fd) < 0) {
         int saved = errno;
-        close(map_go[1]); close(session_ready[0]);
+        close(map_go[1]); close(session_ready[0]); close(bridge_channel[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
         return format_launch_error(launch_error, launch_error_size, stage);
@@ -1335,7 +1785,7 @@ static int create_namespace_session(int socket_fd, int tty_fd,
     install_map(launcher, "gid_map", gid_map);
     if (write_all(map_go[1], "G", 1U) < 0) {
         int saved = errno;
-        close(map_go[1]); close(session_ready[0]);
+        close(map_go[1]); close(session_ready[0]); close(bridge_channel[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
         return format_launch_error(launch_error, launch_error_size, stage);
@@ -1348,6 +1798,7 @@ static int create_namespace_session(int socket_fd, int tty_fd,
     close(session_ready[0]);
     if (ready_result < 0) {
         int saved = errno;
+        close(bridge_channel[0]);
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
         if (startup_detail[0] != '\0' && launch_error_size > 0U)
@@ -1359,13 +1810,16 @@ static int create_namespace_session(int socket_fd, int tty_fd,
     stage = "announce session to login frontend";
     if (write_all(socket_fd, "OK\n", 3U) < 0) {
         int saved = errno;
+        close(bridge_channel[0]);
         (void)kill(launcher, SIGTERM);
         (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
         return format_launch_error(launch_error, launch_error_size, stage);
     }
     stage = "relay session terminal";
-    int relay_result = relay_session(socket_fd, master, tty_fd, launcher);
+    int relay_result = relay_session(socket_fd, master, tty_fd,
+                                     bridge_channel[0], session, launcher);
+    close(bridge_channel[0]);
     if (relay_result != 0) (void)kill(launcher, SIGTERM);
     int relay_errno = errno;
     int status = 0;

@@ -1,2 +1,0 @@
-# Example only; the package deliberately does not install or enable this line.
-tty9::respawn:/sbin/getty -L -n -l /usr/sbin/veyra-root-console 0 tty9 linux

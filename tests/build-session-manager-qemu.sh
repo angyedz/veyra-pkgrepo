@@ -17,6 +17,7 @@ for package in \
     veyra-session-auth \
     veyra-user-root-provisioner \
     veyra-user-root-template \
+    veyra-root-bridge \
     veyra-session-manager; do
     set -- "$repo"/"$package"-*.apk
     [ -f "$1" ] || { echo "Missing built package: $package" >&2; exit 1; }
@@ -39,6 +40,7 @@ apk --root "$system" \
     "$repo"/veyra-session-auth-*.apk \
     "$repo"/veyra-user-root-provisioner-*.apk \
     "$repo"/veyra-user-root-template-*.apk \
+    "$repo"/veyra-root-bridge-*.apk \
     "$repo"/veyra-session-manager-*.apk
 
 chroot "$system" addgroup -g 23150 veyraqa
@@ -112,6 +114,8 @@ chmod 0644 "$out/kernel" "$out/initramfs" \
 test -s "$system/etc/pam.d/veyra-login"
 test -s "$system/usr/lib/security/pam_veyra_session.so"
 test -x "$system/usr/sbin/veyra-session-manager"
+test -x "$system/usr/sbin/veyra-root-console"
 test -x "$system/usr/sbin/veyra-user-root-provisioner"
 test -d "$system/usr/share/veyra/user-root-template"
+test -x "$system/usr/share/veyra/user-root-template/usr/bin/veyra-root-request"
 echo "Built disposable PAM session guest with Alpine kernel $kernel_version"

@@ -18,6 +18,11 @@ The minirootfs archive is pinned by SHA-512. To update the Alpine base, update
 the rebuilt root with `veyra-user-root-provisioner verify` before enabling
 sessions.
 
+The template includes `veyra-root-request`, a fixed-action client for the
+session manager's private per-session control descriptor. It cannot operate
+outside a Veyra-managed session and carries no credentials or caller-selected
+parameters.
+
 This package is an x86_64 prototype. It does not provide a desktop, configure
 the session service, or grant inner root access. The user-root provisioner
 depends on this package so the login manager cannot be installed with a missing
