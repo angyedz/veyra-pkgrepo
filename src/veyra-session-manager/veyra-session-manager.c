@@ -1188,7 +1188,11 @@ static int handle_session_client(int fd) {
     int rootfd = -1, homefd = -1;
     if (open_account_root(&session, &rootfd, &homefd) < 0) {
         close(tty_fd);
-        (void)write_all(fd, "ERROR user-root\n", 16U);
+        char response[160];
+        int length = snprintf(response, sizeof(response), "ERROR user-root: %s\n",
+                              strerror(errno));
+        if (length > 0 && (size_t)length < sizeof(response))
+            (void)write_all(fd, response, (size_t)length);
         return -1;
     }
     char shell[PATH_MAX] = {0}, error[256] = {0};
@@ -1196,7 +1200,11 @@ static int handle_session_client(int fd) {
         close(rootfd); close(homefd); close(tty_fd);
         fprintf(stderr, "veyra-session-manager: refused rootfs for %s: %s\n",
                 session.account, error);
-        (void)write_all(fd, "ERROR user-root\n", 16U);
+        char response[320];
+        int length = snprintf(response, sizeof(response), "ERROR user-root: %s\n",
+                              error[0] ? error : "rootfs validation failed");
+        if (length > 0 && (size_t)length < sizeof(response))
+            (void)write_all(fd, response, (size_t)length);
         return -1;
     }
     int result = create_namespace_session(fd, tty_fd, &session, term,
