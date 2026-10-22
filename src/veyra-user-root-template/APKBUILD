@@ -7,7 +7,9 @@ arch="x86_64"
 license="GPL-2.0-only MIT BSD-2-Clause BSD-3-Clause ISC"
 makedepends="apk-tools"
 source="alpine-minirootfs-$pkgver-x86_64.tar.gz::https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-$pkgver-x86_64.tar.gz"
-sha512sums="3d3ce208455c9fa455a85e0c4f1695a292776dccbe8db302b0934f84c0537b2ca201a56c0c150b421f631e54c21bc35a37668e8b33522e844803998692bbc645"
+sha512sums="
+3d3ce208455c9fa455a85e0c4f1695a292776dccbe8db302b0934f84c0537b2ca201a56c0c150b421f631e54c21bc35a37668e8b33522e844803998692bbc645  alpine-minirootfs-$pkgver-x86_64.tar.gz
+"
 builddir="$srcdir"
 options="!check"
 
