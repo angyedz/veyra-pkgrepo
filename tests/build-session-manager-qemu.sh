@@ -78,6 +78,8 @@ cat > "$system/etc/inittab" <<'EOF'
 ttyS0::respawn:/usr/sbin/veyra-login
 EOF
 
+truncate -s 768M "$out/system.raw"
+truncate -s 768M "$out/user-store.raw"
 mkfs.ext4 -F -q -L VEYRA_QEMU_SYSTEM \
     -E root_owner=0:0 -d "$system" "$out/system.raw"
 mkfs.ext4 -F -q -L VEYRA_QEMU_USER_STORE \
