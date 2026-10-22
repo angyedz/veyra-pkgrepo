@@ -705,37 +705,59 @@ static int fill_random(unsigned char *buffer, size_t length) {
     return 0;
 }
 
+static int format_pin_error(char *error, size_t error_size,
+                            const char *stage) {
+    int saved = errno == 0 ? EIO : errno;
+    if (error_size > 0U)
+        (void)snprintf(error, error_size, "%s: %s", stage, strerror(saved));
+    errno = saved;
+    return -1;
+}
+
 static int prepare_pins(int rootfd, int homefd, uint32_t uid_base,
                         char *pin_dir,
-                        size_t pin_dir_size) {
+                        size_t pin_dir_size, char *error,
+                        size_t error_size) {
     unsigned char random[8];
-    if (fill_random(random, sizeof(random)) < 0) return -1;
+    if (fill_random(random, sizeof(random)) < 0)
+        return format_pin_error(error, error_size, "generate private mount name");
     uint64_t nonce = 0U;
     memcpy(&nonce, random, sizeof(nonce));
     memset(random, 0, sizeof(random));
     if (snprintf(pin_dir, pin_dir_size, RUN_DIR "/pin-%ld-%016llx",
                  (long)getpid(), (unsigned long long)nonce) >=
         (int)pin_dir_size) { errno = ENAMETOOLONG; return -1; }
-    if (mkdir(pin_dir, 0711) < 0) return -1;
+    if (mkdir(pin_dir, 0711) < 0)
+        return format_pin_error(error, error_size, "create private mount directory");
     char root_pin[PATH_MAX], home_pin[PATH_MAX], bootstrap[PATH_MAX];
     if (snprintf(root_pin, sizeof(root_pin), "%s/rootfs", pin_dir) >= (int)sizeof(root_pin) ||
         snprintf(home_pin, sizeof(home_pin), "%s/home", pin_dir) >= (int)sizeof(home_pin) ||
-        snprintf(bootstrap, sizeof(bootstrap), "%s/bootstrap", pin_dir) >= (int)sizeof(bootstrap))
-        return -1;
+        snprintf(bootstrap, sizeof(bootstrap), "%s/bootstrap", pin_dir) >= (int)sizeof(bootstrap)) {
+        errno = ENAMETOOLONG;
+        return format_pin_error(error, error_size, "format private mount paths");
+    }
+    const char *stage = "create private mount points";
     if (mkdir(root_pin, 0711) < 0 || mkdir(home_pin, 0711) < 0 ||
-        mkdir(bootstrap, 0711) < 0 ||
-        chown(bootstrap, (uid_t)uid_base, (gid_t)uid_base) < 0 ||
-        chmod(bootstrap, 0700) < 0 ||
-        bind_directory_fd(rootfd, root_pin) < 0 ||
-        bind_directory_fd(homefd, home_pin) < 0) {
+        mkdir(bootstrap, 0711) < 0) goto fail;
+    stage = "set private root staging ownership";
+    if (chown(bootstrap, (uid_t)uid_base, (gid_t)uid_base) < 0) goto fail;
+    stage = "set private root staging mode";
+    if (chmod(bootstrap, 0700) < 0) goto fail;
+    stage = "bind user root filesystem";
+    if (bind_directory_fd(rootfd, root_pin) < 0) goto fail;
+    stage = "bind persistent home";
+    if (bind_directory_fd(homefd, home_pin) < 0) goto fail;
+    return 0;
+fail:
+    {
         int saved = errno;
         (void)umount2(home_pin, MNT_DETACH);
         (void)umount2(root_pin, MNT_DETACH);
         (void)rmdir(home_pin); (void)rmdir(root_pin); (void)rmdir(bootstrap);
-        (void)rmdir(pin_dir); errno = saved;
-        return -1;
+        (void)rmdir(pin_dir);
+        errno = saved;
     }
-    return 0;
+    return format_pin_error(error, error_size, stage);
 }
 
 static void cleanup_pins(const char *pin_dir) {
@@ -1079,8 +1101,19 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         goto fail;
     char pin_dir[PATH_MAX];
     stage = "pin user root filesystems";
+    char pin_error[192] = {0};
     if (prepare_pins(rootfd, homefd, session->uid_base,
-                     pin_dir, sizeof(pin_dir)) < 0) goto fail;
+                     pin_dir, sizeof(pin_dir), pin_error,
+                     sizeof(pin_error)) < 0) {
+        int saved = errno;
+        if (slave >= 0) close(slave);
+        if (master >= 0) close(master);
+        if (launch_error_size > 0U)
+            (void)snprintf(launch_error, launch_error_size,
+                           "pin user root filesystems: %s", pin_error);
+        errno = saved;
+        return -1;
+    }
     stage = "create namespace synchronization pipes";
     int map_ready[2], map_go[2], session_ready[2];
     if (pipe2(map_ready, O_CLOEXEC) < 0 || pipe2(map_go, O_CLOEXEC) < 0 ||
