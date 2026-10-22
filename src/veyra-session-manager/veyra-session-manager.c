@@ -699,23 +699,24 @@ static int ensure_run_dir(void) {
 static int format_pin_error(char *error, size_t error_size,
                             const char *stage);
 
-static int bind_directory_fd(int fd, const char *target,
-                             const char *open_stage, const char *move_stage,
-                             char *error, size_t error_size) {
-    /* Keep the validated directory fd as the mount source across path changes. */
+static int open_mount_tree_fd(int fd, const char *stage,
+                              char *error, size_t error_size) {
+    /* Clone while the validated fd still belongs to this mount namespace. */
     int tree_fd = (int)syscall(SYS_open_tree, fd, "",
                                AT_EMPTY_PATH | OPEN_TREE_CLONE |
                                OPEN_TREE_CLOEXEC);
     if (tree_fd < 0)
-        return format_pin_error(error, error_size, open_stage);
-    int result = (int)syscall(SYS_move_mount, tree_fd, "", AT_FDCWD,
-                              target, MOVE_MOUNT_F_EMPTY_PATH);
-    int saved = errno;
-    close(tree_fd);
-    errno = saved;
-    if (result < 0)
-        return format_pin_error(error, error_size, move_stage);
-    return result;
+        return format_pin_error(error, error_size, stage);
+    return tree_fd;
+}
+
+static int attach_mount_tree_fd(int tree_fd, const char *target,
+                                const char *stage, char *error,
+                                size_t error_size) {
+    if (syscall(SYS_move_mount, tree_fd, "", AT_FDCWD, target,
+                MOVE_MOUNT_F_EMPTY_PATH) < 0)
+        return format_pin_error(error, error_size, stage);
+    return 0;
 }
 
 static int fill_random(unsigned char *buffer, size_t length) {
@@ -740,8 +741,11 @@ static int format_pin_error(char *error, size_t error_size,
 
 static int prepare_pins(int rootfd, int homefd, uint32_t uid_base,
                         char *pin_dir,
-                        size_t pin_dir_size, char *error,
+                        size_t pin_dir_size, int *root_mount_fd,
+                        int *home_mount_fd, char *error,
                         size_t error_size) {
+    *root_mount_fd = -1;
+    *home_mount_fd = -1;
     unsigned char random[8];
     if (fill_random(random, sizeof(random)) < 0)
         return format_pin_error(error, error_size, "generate private mount name");
@@ -767,40 +771,25 @@ static int prepare_pins(int rootfd, int homefd, uint32_t uid_base,
     if (chown(bootstrap, (uid_t)uid_base, (gid_t)uid_base) < 0) goto fail;
     stage = "set private root staging mode";
     if (chmod(bootstrap, 0700) < 0) goto fail;
-    if (bind_directory_fd(rootfd, root_pin,
-                          "open_tree for user root filesystem",
-                          "move_mount for user root filesystem",
-                          error, error_size) < 0) {
-        int saved = errno;
-        (void)umount2(home_pin, MNT_DETACH);
-        (void)umount2(root_pin, MNT_DETACH);
-        (void)rmdir(home_pin); (void)rmdir(root_pin); (void)rmdir(bootstrap);
-        (void)rmdir(pin_dir);
-        errno = saved;
-        return -1;
-    }
-    if (bind_directory_fd(homefd, home_pin,
-                          "open_tree for persistent home",
-                          "move_mount for persistent home",
-                          error, error_size) < 0) {
-        int saved = errno;
-        (void)umount2(home_pin, MNT_DETACH);
-        (void)umount2(root_pin, MNT_DETACH);
-        (void)rmdir(home_pin); (void)rmdir(root_pin); (void)rmdir(bootstrap);
-        (void)rmdir(pin_dir);
-        errno = saved;
-        return -1;
-    }
+    stage = "open_tree for user root filesystem";
+    *root_mount_fd = open_mount_tree_fd(rootfd, stage, error, error_size);
+    if (*root_mount_fd < 0) goto fail;
+    stage = "open_tree for persistent home";
+    *home_mount_fd = open_mount_tree_fd(homefd, stage, error, error_size);
+    if (*home_mount_fd < 0) goto fail;
     return 0;
 fail:
     {
         int saved = errno;
+        if (*home_mount_fd >= 0) close(*home_mount_fd);
+        if (*root_mount_fd >= 0) close(*root_mount_fd);
         (void)umount2(home_pin, MNT_DETACH);
         (void)umount2(root_pin, MNT_DETACH);
         (void)rmdir(home_pin); (void)rmdir(root_pin); (void)rmdir(bootstrap);
         (void)rmdir(pin_dir);
         errno = saved;
     }
+    if (error[0] != '\0') return -1;
     return format_pin_error(error, error_size, stage);
 }
 
@@ -1140,14 +1129,13 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         errno = EINVAL;
         goto fail;
     }
-    stage = "create private mount namespace";
-    if (unshare(CLONE_NEWNS) < 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
-        goto fail;
-    char pin_dir[PATH_MAX];
-    stage = "pin user root filesystems";
+    char pin_dir[PATH_MAX] = {0};
+    int root_mount_fd = -1, home_mount_fd = -1;
     char pin_error[192] = {0};
+    stage = "prepare detached user root mounts";
     if (prepare_pins(rootfd, homefd, session->uid_base,
-                     pin_dir, sizeof(pin_dir), pin_error,
+                     pin_dir, sizeof(pin_dir), &root_mount_fd,
+                     &home_mount_fd, pin_error,
                      sizeof(pin_error)) < 0) {
         int saved = errno;
         if (slave >= 0) close(slave);
@@ -1158,6 +1146,59 @@ static int create_namespace_session(int socket_fd, int tty_fd,
         errno = saved;
         return -1;
     }
+    stage = "create private mount namespace";
+    if (unshare(CLONE_NEWNS) < 0 ||
+        mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        int saved = errno;
+        close(root_mount_fd); close(home_mount_fd);
+        cleanup_pins(pin_dir);
+        if (slave >= 0) close(slave);
+        if (master >= 0) close(master);
+        errno = saved;
+        return format_launch_error(launch_error, launch_error_size, stage);
+    }
+    char root_pin[PATH_MAX], home_pin[PATH_MAX];
+    if (snprintf(root_pin, sizeof(root_pin), "%s/rootfs", pin_dir) >= (int)sizeof(root_pin) ||
+        snprintf(home_pin, sizeof(home_pin), "%s/home", pin_dir) >= (int)sizeof(home_pin)) {
+        int saved = EOVERFLOW;
+        close(root_mount_fd); close(home_mount_fd);
+        cleanup_pins(pin_dir);
+        if (slave >= 0) close(slave);
+        if (master >= 0) close(master);
+        errno = saved;
+        return format_launch_error(launch_error, launch_error_size,
+                                   "format user-root mount targets");
+    }
+    stage = "attach user root filesystem mount";
+    if (attach_mount_tree_fd(root_mount_fd, root_pin,
+                             "move_mount for user root filesystem",
+                             pin_error, sizeof(pin_error)) < 0) {
+        int saved = errno;
+        close(root_mount_fd); close(home_mount_fd);
+        cleanup_pins(pin_dir);
+        if (slave >= 0) close(slave);
+        if (master >= 0) close(master);
+        if (launch_error_size > 0U)
+            (void)snprintf(launch_error, launch_error_size, "%s", pin_error);
+        errno = saved;
+        return -1;
+    }
+    stage = "attach persistent home mount";
+    if (attach_mount_tree_fd(home_mount_fd, home_pin,
+                             "move_mount for persistent home",
+                             pin_error, sizeof(pin_error)) < 0) {
+        int saved = errno;
+        close(root_mount_fd); close(home_mount_fd);
+        cleanup_pins(pin_dir);
+        if (slave >= 0) close(slave);
+        if (master >= 0) close(master);
+        if (launch_error_size > 0U)
+            (void)snprintf(launch_error, launch_error_size, "%s", pin_error);
+        errno = saved;
+        return -1;
+    }
+    close(root_mount_fd); close(home_mount_fd);
+    root_mount_fd = -1; home_mount_fd = -1;
     stage = "create namespace synchronization pipes";
     int map_ready[2], map_go[2], session_ready[2];
     if (pipe2(map_ready, O_CLOEXEC) < 0 || pipe2(map_go, O_CLOEXEC) < 0 ||
