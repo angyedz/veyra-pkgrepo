@@ -5,11 +5,8 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
-#include <linux/magic.h>
-#include <linux/openat2.h>
 #include <pwd.h>
 #include <poll.h>
-#include <pty.h>
 #include <security/pam_appl.h>
 #include <security/pam_ext.h>
 #include <security/pam_modules.h>
@@ -34,6 +31,21 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef EXT4_SUPER_MAGIC
+#define EXT4_SUPER_MAGIC 0xEF53U
+#endif
+#ifndef RESOLVE_NO_MAGICLINKS
+#define RESOLVE_NO_MAGICLINKS 0x02U
+#endif
+#ifndef RESOLVE_IN_ROOT
+#define RESOLVE_IN_ROOT 0x10U
+#endif
+struct veyra_open_how {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
+};
 
 #define RUN_DIR "/run/veyra-session-manager"
 #define SOCKET_PATH RUN_DIR "/control.sock"
@@ -201,7 +213,7 @@ static int parse_request(char *line, char token[TOKEN_LENGTH + 1U],
 }
 
 static int safe_openat(int rootfd, const char *path, int flags) {
-    struct open_how how = {
+    struct veyra_open_how how = {
         .flags = (uint64_t)(flags | O_CLOEXEC),
         .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
     };
