@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 static int parse_pid(const char *text, pid_t *pid) {
@@ -44,9 +45,9 @@ int main(int argc, char **argv) {
         fputs("veyra-session-grant: session grant was rejected\n", stderr);
         return 1;
     }
-    printf("authorized\t%s\t%u\t%u\t%u\t%d\t%ld\t%ld\n",
+    printf("authorized\t%s\t%u\t%u\t%u\t%d\t%u\t%u\n",
            grant.account, grant.system_uid, grant.system_gid, grant.uid_base,
-           grant.session_id, (long)(grant.tty_device >> 32),
-           (long)(grant.tty_device & 0xffffffffU));
+           grant.session_id, major((dev_t)grant.tty_device),
+           minor((dev_t)grant.tty_device));
     return ferror(stdout) ? 1 : 0;
 }
