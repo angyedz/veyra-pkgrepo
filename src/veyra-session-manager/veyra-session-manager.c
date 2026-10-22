@@ -42,6 +42,15 @@
 #ifndef RESOLVE_IN_ROOT
 #define RESOLVE_IN_ROOT 0x10U
 #endif
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 0x00000001U
+#endif
+#ifndef OPEN_TREE_CLOEXEC
+#define OPEN_TREE_CLOEXEC O_CLOEXEC
+#endif
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004U
+#endif
 struct veyra_open_how {
     uint64_t flags;
     uint64_t mode;
@@ -688,10 +697,17 @@ static int ensure_run_dir(void) {
 }
 
 static int bind_directory_fd(int fd, const char *target) {
-    char source[64];
-    int length = snprintf(source, sizeof(source), "/proc/self/fd/%d/", fd);
-    if (length < 0 || length >= (int)sizeof(source)) { errno = EINVAL; return -1; }
-    return mount(source, target, NULL, MS_BIND, NULL);
+    /* Keep the validated directory fd as the mount source across path changes. */
+    int tree_fd = (int)syscall(SYS_open_tree, fd, "",
+                               AT_EMPTY_PATH | OPEN_TREE_CLONE |
+                               OPEN_TREE_CLOEXEC);
+    if (tree_fd < 0) return -1;
+    int result = (int)syscall(SYS_move_mount, tree_fd, "", AT_FDCWD,
+                              target, MOVE_MOUNT_F_EMPTY_PATH);
+    int saved = errno;
+    close(tree_fd);
+    errno = saved;
+    return result;
 }
 
 static int fill_random(unsigned char *buffer, size_t length) {
