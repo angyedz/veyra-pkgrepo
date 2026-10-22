@@ -23,7 +23,6 @@ TEST_USERS = (
     (b"veyraqa", b"Veyra-Session-QEMU-2026!", 300000),
     (b"veyraqa2", b"Veyra-Session-QEMU-Second-2026!", 400000),
 )
-ROOT_PASSWORD = b"Veyra-Session-QEMU-Root-2026!"
 
 
 def wait_for_login(guest, timeout=240):
@@ -178,10 +177,9 @@ def main():
                 login_user(guest1, TEST_USERS[1][0], TEST_USERS[1][1])
                 prove_user_session(guest1, TEST_USERS[1][0], TEST_USERS[1][2])
 
-                # ttyS2 remains in the system root and can restart the manager.
-                wait_for_login(guest2)
-                authenticate(guest2, b"root", ROOT_PASSWORD)
-                guest2.expect(SHELL, timeout=60)
+                # This disposable root shell is only a test control console;
+                # the user-facing sessions above still use PAM login.
+                guest2.expect(SHELL, timeout=90)
                 disable_terminal_echo(guest2)
 
                 # Killing the host-owned login frontend simulates an
