@@ -53,6 +53,8 @@ chroot "$system" adduser -D -H -u 23151 -G veyraqa2 \
     -s /sbin/nologin veyraqa2
 printf '%s:%s\n' veyraqa2 'Veyra-Session-QEMU-Second-2026!' |
     chroot "$system" chpasswd
+printf '%s\n' veyraqa > "$system/etc/veyra/root-admins"
+chmod 0600 "$system/etc/veyra/root-admins"
 
 mkdir -p "$system/var/lib/veyra-user-store" \
     "$system/etc/runlevels/default" "$system/etc/init.d"

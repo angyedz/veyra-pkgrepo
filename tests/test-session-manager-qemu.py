@@ -124,6 +124,22 @@ def prove_root_bridge_denies_unlisted_account(guest):
         )
 
 
+def prove_root_bridge_rejects_serial_tty(guest):
+    marker = b"VEYRA_ROOT_BRIDGE_SERIAL_TTY_DENIAL_PASS"
+    command = (
+        b"if veyra-root-request >/tmp/veyra-root-request.log 2>&1; then "
+        b"echo ROOT_BRIDGE_UNEXPECTED_SUCCESS; else "
+        b"cat /tmp/veyra-root-request.log; "
+        b"grep -q 'no trusted local system console is available' "
+        b"/tmp/veyra-root-request.log && echo " + marker + b"; fi"
+    )
+    transcript = run_shell_command(guest, command, marker)
+    if marker not in transcript:
+        raise RuntimeError(
+            "the system manager did not reject an allowlisted account's serial-TTY request"
+        )
+
+
 def prove_persistent_home(guest, account):
     name = account.decode("ascii")
     marker = f"VEYRA_SESSION_PERSISTENCE_PASS_{name}".encode("ascii")
@@ -195,12 +211,13 @@ def main():
                 guest0.expect(SHELL, timeout=90)
                 disable_terminal_echo(guest0)
                 prove_user_session(guest0, TEST_USERS[0][0], TEST_USERS[0][2])
-                prove_root_bridge_denies_unlisted_account(guest0)
+                prove_root_bridge_rejects_serial_tty(guest0)
 
                 # A second standard Linux account must use a separate mapped
                 # root and home while the first account remains active.
                 login_user(guest1, TEST_USERS[1][0], TEST_USERS[1][1])
                 prove_user_session(guest1, TEST_USERS[1][0], TEST_USERS[1][2])
+                prove_root_bridge_denies_unlisted_account(guest1)
 
                 # This disposable root shell is only a test control console;
                 # the user-facing sessions above still use PAM login.
@@ -263,9 +280,10 @@ def main():
 
     print(
         "VEYRA_SESSION_MANAGER_QEMU_PASS: wrong password rejected; two ordinary system "
-        "accounts ran concurrently in separate mapped roots; an unlisted account could "
-        "not trigger the system-root console; client disconnect, manager restart and "
-        "logout ended sessions; both separate homes persisted"
+        "accounts ran concurrently in separate mapped roots; an allowlisted serial-TTY "
+        "request and an unlisted account's request could not trigger the system-root "
+        "console; client disconnect, manager restart and logout ended sessions; both "
+        "separate homes persisted"
     )
 
 
