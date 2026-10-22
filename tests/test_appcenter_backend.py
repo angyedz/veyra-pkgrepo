@@ -54,6 +54,39 @@ class PackageParsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             backend.featured_packages("Gaming")
 
+    def test_flatpak_search_and_installed(self):
+        output = (
+            "com.discordapp.Discord\tDiscord\tVoice and text chat\n"
+            "org.telegram.desktop  Telegram Desktop\n"
+            "not-an-app-id\tIgnore this row\n"
+        )
+        found = backend.parse_flatpak_list(output)
+        self.assertEqual([p["name"] for p in found], [
+            "com.discordapp.Discord", "org.telegram.desktop"
+        ])
+        self.assertEqual(found[0]["title"], "Discord")
+        installed = backend.parse_flatpak_list(
+            "Application\tName\tVersion\ncom.discordapp.Discord\tDiscord\t1.0\n",
+            installed=True,
+        )
+        self.assertEqual(installed[0]["name"], "com.discordapp.Discord")
+        self.assertTrue(installed[0]["installed"])
+
+    def test_flatpak_featured_apps_are_user_scoped(self):
+        featured = backend.featured_flatpak_packages()
+        self.assertIn("com.discordapp.Discord", [p["name"] for p in featured])
+        self.assertIn("org.telegram.desktop", [p["name"] for p in featured])
+        self.assertTrue(all(p["source"] == "flatpak" for p in featured))
+        self.assertEqual(backend.featured_flatpak_packages("Internet")[0]["name"],
+                         "com.discordapp.Discord")
+
+    def test_flatpak_app_ids_reject_arguments(self):
+        for invalid in ("", "-delete", "com.app;id", "org..app", "../escape"):
+            with self.assertRaises(ValueError):
+                backend.validate_flatpak_id(invalid)
+        self.assertEqual(backend.validate_flatpak_id("com.discordapp.Discord"),
+                         "com.discordapp.Discord")
+
     def test_validation(self):
         for invalid in ("", "-danger", "bad space", "../escape", "a;id", "a"*129):
             with self.assertRaises(ValueError):

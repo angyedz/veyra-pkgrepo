@@ -26,7 +26,9 @@ jobs:
           path: distro-source
           persist-credentials: false
       - name: Install tools
-        run: apk add --no-cache alpine-sdk go git openssl ca-certificates && apk update
+        run: apk add --no-cache alpine-sdk go git openssl ca-certificates python3 && apk update
+      - name: Test application catalog and safe package parsing
+        run: python3 -m unittest discover -s tests -p 'test_appcenter_backend.py'
       - name: Test vpkg
         run: cd distro-source/vpkg && go test ./... && go vet ./...
       - name: Configure isolated builder and signing
@@ -66,6 +68,16 @@ jobs:
           actual=$(find packages/repo/x86_64 -maxdepth 1 -name '*.apk' | wc -l)
           echo "Built $actual of $expected APK packages"
           test "$actual" -ge "$expected"
+      - name: Launch the built AppCenter package
+        run: |
+          set -eu
+          apk add --no-cache "$GITHUB_WORKSPACE/packages/repo/x86_64/veyra-appcenter-0.4.0-r0.apk"
+          set +e
+          QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software timeout 8s veyra-appcenter > /tmp/veyra-appcenter.log 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 124
+          grep -q 'VEYRA_QML_READY' /tmp/veyra-appcenter.log
       - uses: actions/upload-artifact@v4
         with:
           name: veyra-apks-${{ github.sha }}

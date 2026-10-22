@@ -6,7 +6,9 @@ import json
 import re
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+@-]{0,127}$")
+FLATPAK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
 APK_VERSION_RE = re.compile(r"^(?P<name>.+)-(?P<version>[0-9][A-Za-z0-9._+~:-]*)-r[0-9]+$")
+FLATHUB_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
 
 
 def validate_name(value):
@@ -47,6 +49,38 @@ def parse_apk_installed(output):
                 "source": "apk", "removeKey": "", "installed": True,
             })
     return packages[:5000]
+
+
+def validate_flatpak_id(value):
+    if not isinstance(value, str) or not FLATPAK_ID_RE.fullmatch(value):
+        raise ValueError("Invalid Flatpak application ID")
+    return value
+
+
+def parse_flatpak_list(output, installed=False):
+    """Parse Flatpak's application/name/description column output safely."""
+    packages = []
+    seen = set()
+    for line in output.splitlines():
+        fields = [part.strip() for part in line.split("\t")]
+        if len(fields) == 1:
+            fields = line.strip().split(None, 1)
+        if not fields:
+            continue
+        app_id = fields[0]
+        if not FLATPAK_ID_RE.fullmatch(app_id) or app_id in seen:
+            continue
+        seen.add(app_id)
+        title = fields[1] if len(fields) > 1 and fields[1] else app_id
+        description = fields[2] if len(fields) > 2 else ""
+        packages.append({
+            "name": app_id, "title": title, "version": "",
+            "description": description, "source": "flatpak",
+            "removeKey": "", "installed": installed,
+        })
+        if len(packages) >= 250:
+            break
+    return packages
 
 
 def parse_nix_search(output):
@@ -122,6 +156,13 @@ FEATURED_APPS = (
     ("transmission-gtk", "Transmission", "A simple BitTorrent client", "Utilities"),
 )
 
+FLATPAK_FEATURED_APPS = (
+    ("com.discordapp.Discord", "Discord", "Discord desktop client from Flathub", "Internet"),
+    ("org.telegram.desktop", "Telegram Desktop", "Telegram messaging app", "Internet"),
+    ("org.videolan.VLC", "VLC", "Video and audio player", "Media"),
+    ("org.gimp.GIMP", "GIMP", "Edit photos and images", "Creative"),
+)
+
 
 def featured_packages(category="All"):
     if category not in ("All", "Internet", "Office", "Media", "Creative", "Utilities"):
@@ -133,6 +174,20 @@ def featured_packages(category="All"):
             "source": "apk", "removeKey": "", "installed": False
         }
         for name, title, description, section in FEATURED_APPS
+        if category == "All" or category == section
+    ]
+
+
+def featured_flatpak_packages(category="All"):
+    if category not in ("All", "Internet", "Office", "Media", "Creative", "Utilities"):
+        raise ValueError("Unknown category")
+    return [
+        {
+            "name": app_id, "title": title, "version": "Flathub",
+            "description": description, "category": section,
+            "source": "flatpak", "removeKey": "", "installed": False,
+        }
+        for app_id, title, description, section in FLATPAK_FEATURED_APPS
         if category == "All" or category == section
     ]
 
