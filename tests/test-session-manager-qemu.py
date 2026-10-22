@@ -9,7 +9,7 @@ import sys
 import pexpect
 
 
-LOGIN = re.compile(rb"(?i)(?:login|username):\s*$")
+LOGIN = re.compile(rb"(?im)^(?:login|username):[ \t]*\r?$")
 PASSWORD = re.compile(rb"(?i)password:\s*$")
 SHELL = re.compile(rb"[$#] ")
 TEST_PASSWORD = b"Veyra-Session-QEMU-2026!"
