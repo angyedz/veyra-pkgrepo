@@ -1595,8 +1595,10 @@ static int self_test(void) {
         fputs("self-test: malformed authorization record was accepted\n", stderr);
         return 1;
     }
-    char *const discard_argv[] = { (char *)"/bin/printf", (char *)"ok", NULL };
-    if (run_capture("/bin/printf", discard_argv, NULL, 0U) < 0) {
+    char *const discard_argv[] = {
+        (char *)"/bin/sh", (char *)"-c", (char *)"printf ok", NULL
+    };
+    if (run_capture("/bin/sh", discard_argv, NULL, 0U) < 0) {
         fputs("self-test: bounded subprocess output discard failed\n", stderr);
         return 1;
     }
