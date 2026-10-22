@@ -95,13 +95,14 @@ def main():
                 b"VEYRA_QEMU_SESSION_PROOF",
                 b"1000",
                 b"PID=1",
-                b"0 300000 65536",
                 b"HOST_DEVICE_HIDDEN",
                 b"HOST_SOCKET_HIDDEN",
                 b"INNER_SUDO_DENIED",
             ):
                 if expected not in proof:
                     raise RuntimeError(f"missing isolated-session evidence: {expected!r}")
+            if re.search(rb"(?m)^\s*0\s+300000\s+65536\s*$", proof) is None:
+                raise RuntimeError("the isolated user namespace UID map is incorrect")
 
             guest.sendline(b"exit")
             wait_for_login(guest, timeout=90)
