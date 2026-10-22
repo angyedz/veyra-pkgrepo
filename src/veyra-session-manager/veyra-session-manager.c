@@ -651,15 +651,27 @@ static int validate_peer_tty(const struct ucred *peer,
     if (ttyfd < 0) return -1;
     struct stat st;
     pid_t sid = getsid(peer->pid);
+    int failure = 0;
     int terminal_sid = 0;
-    if (fstat(ttyfd, &st) < 0 || !S_ISCHR(st.st_mode) ||
-        (uint32_t)major(st.st_rdev) != session->tty_major ||
-        (uint32_t)minor(st.st_rdev) != session->tty_minor ||
-        sid != session->session_id ||
-        ioctl(ttyfd, TIOCGSID, &terminal_sid) < 0 ||
-        terminal_sid != session->session_id) {
+    if (fstat(ttyfd, &st) < 0) {
+        failure = errno;
+    } else if (!S_ISCHR(st.st_mode)) {
+        failure = ENOTTY;
+    } else if ((uint32_t)major(st.st_rdev) != session->tty_major ||
+               (uint32_t)minor(st.st_rdev) != session->tty_minor) {
+        failure = ENODEV;
+    } else if (sid < 0) {
+        failure = errno;
+    } else if (sid != session->session_id) {
+        failure = ESRCH;
+    } else if (ioctl(ttyfd, TIOCGSID, &terminal_sid) < 0) {
+        failure = errno;
+    } else if (terminal_sid != session->session_id) {
+        failure = EACCES;
+    }
+    if (failure != 0) {
         close(ttyfd);
-        errno = EACCES;
+        errno = failure;
         return -1;
     }
     *tty_fd_out = ttyfd;
@@ -1163,7 +1175,11 @@ static int handle_session_client(int fd) {
     memset(token, 0, sizeof(token));
     int tty_fd = -1;
     if (validate_peer_tty(&peer, &session, &tty_fd) < 0) {
-        (void)write_all(fd, "ERROR terminal\n", 15U);
+        char response[128];
+        int length = snprintf(response, sizeof(response), "ERROR terminal: %s\n",
+                              strerror(errno));
+        if (length > 0 && (size_t)length < sizeof(response))
+            (void)write_all(fd, response, (size_t)length);
         return -1;
     }
     if (provision_account(session.account) < 0) {
