@@ -82,14 +82,18 @@ jobs:
       - name: Print QEMU serial diagnostics
         if: failure()
         run: |
-          test ! -s "$GITHUB_WORKSPACE/session-manager-qemu-serial.log" || \
-            tail -n 240 "$GITHUB_WORKSPACE/session-manager-qemu-serial.log"
+          for log in "$GITHUB_WORKSPACE"/session-manager-qemu-serial*.log; do
+            test ! -s "$log" || {
+              echo "===== $log ====="
+              tail -n 240 "$log"
+            }
+          done
       - name: Save QEMU serial proof
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: veyra-session-manager-qemu-serial
-          path: session-manager-qemu-serial.log
+          path: session-manager-qemu-serial*.log
           retention-days: 7
           if-no-files-found: ignore
       - name: Validate artifact count and index

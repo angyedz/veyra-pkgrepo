@@ -950,7 +950,9 @@ static void inner_session(struct launcher_args *args) {
         child_fail("mount user-private runtime filesystems");
     if (chdir("/home") < 0 || chdir(args->account) < 0)
         child_fail("enter persistent home");
-    if (setgid(1000U) < 0 || setuid(1000U) < 0)
+    if (setgid(1000U) < 0 || setuid(1000U) < 0 ||
+        prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 ||
+        getppid() != args->expected_parent)
         child_fail("drop to the user account");
     (void)prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
     if (close_child_fds(args->session_ready_write) < 0)
@@ -981,6 +983,12 @@ static void inner_session(struct launcher_args *args) {
 }
 
 static void namespace_launcher(struct launcher_args *args) {
+    struct sigaction default_action = {0};
+    default_action.sa_handler = SIG_DFL;
+    sigemptyset(&default_action.sa_mask);
+    if (sigaction(SIGTERM, &default_action, NULL) < 0 ||
+        sigaction(SIGINT, &default_action, NULL) < 0)
+        child_fail("reset namespace launcher signals");
     startup_error_fd = args->session_ready_write;
     if (setgroups(0U, NULL) < 0 || setgid((gid_t)args->uid_base) < 0 ||
         setuid((uid_t)args->uid_base) < 0 ||
@@ -1089,7 +1097,7 @@ static int relay_session(int socket_fd, int master_fd, int tty_fd, pid_t launche
     struct winsize previous = {0};
     if (ioctl(tty_fd, TIOCGWINSZ, &previous) == 0)
         (void)ioctl(master_fd, TIOCSWINSZ, &previous);
-    while (!socket_eof && (!pty_eof || output.length > 0U)) {
+    while (!socket_eof && (!pty_eof || output.length > 0U) && !stopping) {
         struct pollfd fds[3];
         fds[0] = (struct pollfd){ .fd = socket_fd,
             .events = (short)((socket_eof || input.length == sizeof(input.bytes) ? 0 : POLLIN) |
@@ -1132,6 +1140,7 @@ static int relay_session(int socket_fd, int master_fd, int tty_fd, pid_t launche
             launcher_pidfd = -1;
         }
     }
+    if (stopping) socket_eof = 1;
     if (launcher_pidfd >= 0) close(launcher_pidfd);
     if (socket_eof) return 1;
     return result;
@@ -1487,15 +1496,43 @@ static void request_stop(int signal_number) {
     stopping = 1;
 }
 
-static void reap_workers(void) {
+static void reap_workers(pid_t *workers) {
     int status;
-    while (waitpid(-1, &status, WNOHANG) > 0) {
-        if (active_workers > 0U) active_workers--;
+    pid_t worker;
+    while ((worker = waitpid(-1, &status, WNOHANG)) > 0) {
+        for (size_t index = 0U; index < MAX_SESSION_WORKERS; index++) {
+            if (workers[index] == worker) {
+                workers[index] = 0;
+                if (active_workers > 0U) active_workers--;
+                break;
+            }
+        }
     }
+}
+
+static void stop_workers(pid_t *workers) {
+    for (size_t index = 0U; index < MAX_SESSION_WORKERS; index++)
+        if (workers[index] > 0) (void)kill(workers[index], SIGTERM);
+
+    const struct timespec interval = { .tv_sec = 0, .tv_nsec = 100000000L };
+    for (unsigned attempt = 0U; attempt < 50U && active_workers > 0U; attempt++) {
+        reap_workers(workers);
+        if (active_workers == 0U) return;
+        (void)nanosleep(&interval, NULL);
+    }
+
+    for (size_t index = 0U; index < MAX_SESSION_WORKERS; index++) {
+        if (workers[index] <= 0) continue;
+        (void)kill(workers[index], SIGKILL);
+        while (waitpid(workers[index], NULL, 0) < 0 && errno == EINTR) {}
+        workers[index] = 0;
+    }
+    active_workers = 0U;
 }
 
 static int serve(void) {
     if (geteuid() != 0U || ensure_run_dir() < 0) { errno = EPERM; return 1; }
+    pid_t workers[MAX_SESSION_WORKERS] = {0};
     int listener = -1;
     if (prepare_socket(&listener) < 0) return 1;
     struct sigaction action = {0};
@@ -1511,14 +1548,16 @@ static int serve(void) {
         int result;
         do { result = poll(&item, 1U, 500); } while (result < 0 && errno == EINTR);
         if (result < 0) break;
-        reap_workers();
+        reap_workers(workers);
         if (result == 0 || (item.revents & POLLIN) == 0) continue;
         int client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
         if (client < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             break;
         }
-        if (active_workers >= MAX_SESSION_WORKERS) {
+        size_t slot = 0U;
+        while (slot < MAX_SESSION_WORKERS && workers[slot] > 0) slot++;
+        if (active_workers >= MAX_SESSION_WORKERS || slot == MAX_SESSION_WORKERS) {
             (void)write_all(client, "ERROR busy\n", 11U);
             close(client);
             continue;
@@ -1527,7 +1566,7 @@ static int serve(void) {
         pid_t worker = fork();
         if (worker == 0) {
             close(listener);
-            if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent)
+            if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent)
                 _exit(1);
             int result = handle_session_client(client);
             close(client);
@@ -1535,11 +1574,14 @@ static int serve(void) {
         }
         close(client);
         if (worker < 0) perror("veyra-session-manager: fork");
-        else active_workers++;
+        else {
+            workers[slot] = worker;
+            active_workers++;
+        }
     }
     close(listener);
     (void)unlink(SOCKET_PATH);
-    reap_workers();
+    stop_workers(workers);
     return 0;
 }
 

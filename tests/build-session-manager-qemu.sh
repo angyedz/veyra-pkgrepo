@@ -46,6 +46,13 @@ chroot "$system" adduser -D -H -u 23150 -G veyraqa \
     -s /sbin/nologin veyraqa
 printf '%s:%s\n' veyraqa 'Veyra-Session-QEMU-2026!' |
     chroot "$system" chpasswd
+chroot "$system" addgroup -g 23151 veyraqa2
+chroot "$system" adduser -D -H -u 23151 -G veyraqa2 \
+    -s /sbin/nologin veyraqa2
+printf '%s:%s\n' veyraqa2 'Veyra-Session-QEMU-Second-2026!' |
+    chroot "$system" chpasswd
+printf '%s:%s\n' root 'Veyra-Session-QEMU-Root-2026!' |
+    chroot "$system" chpasswd
 
 mkdir -p "$system/var/lib/veyra-user-store" \
     "$system/etc/runlevels/default" "$system/etc/init.d"
@@ -63,7 +70,8 @@ depend() {
 
 start() {
 	ebegin "Enroll disposable QEMU account"
-	/usr/sbin/veyra-account-registry enroll veyraqa
+	/usr/sbin/veyra-account-registry enroll veyraqa &&
+		/usr/sbin/veyra-account-registry enroll veyraqa2
 	eend $?
 }
 EOF
@@ -72,12 +80,24 @@ ln -s /etc/init.d/veyra-session-qemu-enroll \
     "$system/etc/runlevels/default/veyra-session-qemu-enroll"
 ln -s /etc/init.d/veyra-session-manager \
     "$system/etc/runlevels/default/veyra-session-manager"
+mkdir -p "$system/usr/local/sbin"
+for tty in ttyS0 ttyS1; do
+    cat > "$system/usr/local/sbin/veyra-qemu-login-$tty" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$\$" > /run/veyra-qemu-login-$tty.pid
+exec /usr/sbin/veyra-login
+EOF
+    chmod 0755 "$system/usr/local/sbin/veyra-qemu-login-$tty"
+done
+printf '%s\n' ttyS2 >> "$system/etc/securetty"
 cat > "$system/etc/inittab" <<'EOF'
 ::sysinit:/sbin/openrc sysinit
 ::sysinit:/sbin/openrc boot
 ::wait:/sbin/openrc default
 ::shutdown:/sbin/openrc shutdown
-ttyS0::respawn:/usr/sbin/veyra-login
+ttyS0::respawn:/usr/local/sbin/veyra-qemu-login-ttyS0
+ttyS1::respawn:/usr/local/sbin/veyra-qemu-login-ttyS1
+ttyS2::respawn:/sbin/getty -L 115200 ttyS2 vt100
 EOF
 
 truncate -s 768M "$out/system.raw"
