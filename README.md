@@ -24,6 +24,7 @@ Veyra AppCenter is a Qt Quick interface for signed APK packages, optional
 user-scoped Flatpak applications from Flathub, and optional user-scoped Nix.
 Alpine Stable and Flathub supply the application catalogs. Flatpak applications
 are installed into the current account's home; the system APK lane remains
-administrator-managed. glenv is a glibc runtime compatibility environment, not
-a package manager. The GitHub raw path is a development mirror and needs CDN
-validation for production use.
+administrator-managed in Veyra AppCenter. KDE Discover is configured for
+Flathub; Veyra AppCenter supplies APK search and installs. glenv is a glibc
+runtime compatibility environment, not a package manager. The GitHub raw path
+is a development mirror and needs CDN validation for production use.
