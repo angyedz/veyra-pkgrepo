@@ -150,8 +150,7 @@ def wait_for_console_text(guest, number, text, timeout=90):
         marker = f"VEYRA_VT{number}_SCREEN_CAPTURE_END".encode("ascii")
         dump = run_shell_command(
             guest,
-            b"cat " + device + b" | tr -d '\\000' | fold -w 80 | tail -n 5; "
-            b"echo " + marker,
+            b"cat " + device + b" | tr -d '\\000' | fold -w 80; echo " + marker,
             marker,
         )
         print(
