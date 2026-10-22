@@ -32,7 +32,9 @@ apk --root "$system" --initdb \
     --keys-dir /etc/apk/keys \
     --repositories-file /etc/apk/repositories \
     add alpine-base openrc shadow
-apk --root "$system" --keys-dir /etc/apk/keys add \
+apk --root "$system" \
+    --keys-dir /etc/apk/keys \
+    --repositories-file /etc/apk/repositories add \
     "$repo"/veyra-account-registry-*.apk \
     "$repo"/veyra-session-auth-*.apk \
     "$repo"/veyra-user-root-provisioner-*.apk \
