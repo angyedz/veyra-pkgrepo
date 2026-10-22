@@ -13,7 +13,10 @@ import pexpect
 from pexpect.fdpexpect import fdspawn
 
 
-LOGIN = re.compile(rb"(?im)^(?:login|username):[ \t]*\r?$")
+LOGIN = re.compile(
+    rb"(?im)^(?:(?:\([^)]+\)|[A-Za-z0-9_.-]+)[ \t]+)?"
+    rb"(?:login|username):[ \t]*\r?$"
+)
 PASSWORD = re.compile(rb"(?i)password:\s*$")
 SHELL = re.compile(rb"[$#] ")
 TEST_USERS = (
@@ -225,9 +228,9 @@ def main():
                 wait_for_login(guest0, timeout=90)
             finally:
                 if guest1 is not None:
-                    guest1.close(force=True)
+                    guest1.close()
                 if guest2 is not None:
-                    guest2.close(force=True)
+                    guest2.close()
                 guest0.close(force=True)
 
     print(
