@@ -20,7 +20,8 @@ expect_fail() {
 [ "$(id -u)" -eq 0 ] || fail "must run as root to verify mapped ownership"
 command -v flock >/dev/null || fail "flock is required"
 mkdir -p "$tmp/bin" "$tmp/run" "$template/sbin" "$template/usr/bin" \
-    "$template/etc/sudoers.d" "$template/home/veyrauser" "$template/var/lib"
+    "$template/dev" "$template/etc/sudoers.d" "$template/home/veyrauser" \
+    "$template/var/lib"
 mkdir -p "$store"
 cat >"$registry" <<'EOF'
 #!/bin/sh
@@ -95,6 +96,12 @@ grep -q '^alice:!:1:0:' "$account_dir/rootfs/etc/shadow" ||
     fail "inner password verifier was not discarded and locked"
 [ -f "$account_dir/home/.profile" ] || fail "home skeleton was not copied to separate persistent storage"
 [ -d "$account_dir/rootfs/home/alice" ] || fail "rootfs home mountpoint was not created"
+[ -c "$account_dir/rootfs/dev/console" ] || fail "safe console device was not created"
+[ -c "$account_dir/rootfs/dev/null" ] || fail "safe null device was not created"
+[ -c "$account_dir/rootfs/dev/tty" ] || fail "safe tty device was not created"
+[ -c "$account_dir/rootfs/dev/zero" ] || fail "safe zero device was not created"
+[ -c "$account_dir/rootfs/dev/random" ] || fail "safe random device was not created"
+[ -c "$account_dir/rootfs/dev/urandom" ] || fail "safe urandom device was not created"
 [ ! -e "$account_dir/rootfs/home/veyrauser" ] || fail "template home was left inside the user root"
 [ "$(stat -c '%a' "$account_dir/rootfs/usr/bin/sudo")" = '4755' ] || fail "inner sudo lost its namespace-local setuid mode"
 

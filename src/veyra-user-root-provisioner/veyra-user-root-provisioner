@@ -68,6 +68,11 @@ verify_account() {
     [ "$(cat "$metadata")" = "$expected" ] || fail "account metadata does not match registry identity"
     [ -d "$rootfs" ] && [ ! -L "$rootfs" ] || fail "user rootfs is missing or unsafe"
     [ -x "$rootfs/sbin/init" ] || fail "user rootfs has no executable /sbin/init"
+    [ -d "$rootfs/dev" ] && [ ! -L "$rootfs/dev" ] || fail "user rootfs has no safe /dev directory"
+    for device in console null tty zero random urandom; do
+        [ -c "$rootfs/dev/$device" ] && [ ! -L "$rootfs/dev/$device" ] ||
+            fail "user rootfs has no safe /dev/$device device node"
+    done
     [ -d "$home" ] && [ ! -L "$home" ] || fail "persistent home is missing or unsafe"
     [ "$(stat -c '%u:%g:%a' "$home")" = "$mapped_user_id:$mapped_user_id:700" ] ||
         fail "persistent home has unexpected mapped ownership or mode"
@@ -120,6 +125,8 @@ case "$template_mode" in *[!0-7]*|'') fail "template has an invalid mode" ;; esa
 [ -x "$template/sbin/init" ] || fail "template has no executable /sbin/init"
 [ -d "$template/home/veyrauser" ] && [ ! -L "$template/home/veyrauser" ] ||
     fail "template has no safe inner-user home skeleton"
+[ -d "$template/dev" ] && [ ! -L "$template/dev" ] ||
+    fail "template has no safe /dev directory"
 [ -f "$template/usr/bin/sudo" ] && [ ! -L "$template/usr/bin/sudo" ] ||
     fail "template has no regular inner sudo binary"
 [ -f "$template/etc/passwd" ] && [ ! -L "$template/etc/passwd" ] || fail "template passwd file is unsafe"
@@ -166,6 +173,21 @@ trap 'exit 1' HUP INT TERM
 mkdir -m 0700 "$stage"
 mkdir -m 0700 "$stage/rootfs" "$stage/home"
 cp -a "$template/." "$stage/rootfs/"
+make_device() {
+    path=$1
+    mode=$2
+    device_major=$3
+    device_minor=$4
+    [ ! -e "$path" ] && [ ! -L "$path" ] || fail "template occupies required device path"
+    mknod -m "$mode" "$path" c "$device_major" "$device_minor" ||
+        fail "cannot create safe user-root device node"
+}
+make_device "$stage/rootfs/dev/console" 0600 5 1
+make_device "$stage/rootfs/dev/null" 0666 1 3
+make_device "$stage/rootfs/dev/tty" 0666 5 0
+make_device "$stage/rootfs/dev/zero" 0666 1 5
+make_device "$stage/rootfs/dev/random" 0666 1 8
+make_device "$stage/rootfs/dev/urandom" 0666 1 9
 cp -a "$stage/rootfs/home/veyrauser/." "$stage/home/"
 rm -rf -- "$stage/rootfs/home/veyrauser"
 mkdir -m 0700 "$stage/rootfs/home/$name"

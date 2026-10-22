@@ -19,8 +19,10 @@ system package input and must contain an executable
 `.veyra-user-template` marker containing `VEYRA-USER-ROOT-TEMPLATE 1`. The
 provisioner rejects passwordless sudo rules and any enabled password field in
 the template. It renames the inner account to the enrolled name, locks its
-copied password field, moves home contents to the separate persistent home,
-then atomically publishes both at:
+copied password field, creates only the six device nodes required by the
+isolated runtime (`console`, `null`, `tty`, `zero`, `random`, and `urandom`),
+moves home contents to the separate persistent home, then atomically publishes
+both at:
 
 ```text
 /var/lib/veyra-user-store/users/USER/rootfs
