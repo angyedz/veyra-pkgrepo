@@ -29,7 +29,7 @@ jobs:
         run: apk add --no-cache alpine-sdk go git openssl ca-certificates && apk update
       - name: Verify root-owned account registry behavior
         run: |
-          apk add --no-cache shadow sudo coreutils util-linux-misc python3 linux-pam-dev
+          apk add --no-cache shadow sudo coreutils util-linux-misc python3 linux-headers linux-pam-dev
           sh tests/test-account-registry.sh
           sh tests/test-user-root-provisioner.sh
           sh tests/test-session-auth.sh
