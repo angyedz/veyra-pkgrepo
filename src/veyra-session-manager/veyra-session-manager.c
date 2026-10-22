@@ -92,6 +92,7 @@ struct tree_scan {
 
 static volatile sig_atomic_t stopping;
 static unsigned active_workers;
+static int startup_error_fd = -1;
 
 static int client_login(void);
 
@@ -826,7 +827,34 @@ static int wait_byte(int fd, char expected, int timeout_ms) {
     return 0;
 }
 
+static int wait_session_ready(int fd, char *detail, size_t detail_size,
+                              int timeout_ms) {
+    struct pollfd item = { .fd = fd, .events = POLLIN };
+    int result;
+    do { result = poll(&item, 1U, timeout_ms); } while (result < 0 && errno == EINTR);
+    if (result == 0) { errno = ETIMEDOUT; return -1; }
+    if (result < 0) return -1;
+    char message[256] = {0};
+    ssize_t amount = read(fd, message, sizeof(message));
+    if (amount <= 0) { errno = ECHILD; return -1; }
+    if (message[0] == 'R') return 0;
+    if (message[0] == 'E') {
+        if (detail_size > 0U)
+            (void)snprintf(detail, detail_size, "%s", message + 1);
+        errno = ECHILD;
+        return -1;
+    }
+    errno = EPROTO;
+    return -1;
+}
+
 static void child_fail(const char *message) {
+    if (startup_error_fd >= 0) {
+        char detail[256] = { 'E' };
+        (void)snprintf(detail + 1, sizeof(detail) - 1U, "%s: %s",
+                       message, strerror(errno));
+        (void)write_all(startup_error_fd, detail, sizeof(detail));
+    }
     dprintf(STDERR_FILENO, "veyra-session-manager: session launch failed: %s: %s\n",
             message, strerror(errno));
     _exit(1);
@@ -848,9 +876,12 @@ struct launcher_args {
 };
 
 static void inner_session(struct launcher_args *args) {
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 ||
-        getppid() != args->expected_parent)
-        _exit(1);
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0)
+        child_fail("set session parent-death signal");
+    if (getppid() != args->expected_parent) {
+        errno = ECHILD;
+        child_fail("verify session launcher parent");
+    }
     if (setsid() < 0 || ioctl(args->tty_slave, TIOCSCTTY, 0) < 0 ||
         tcsetpgrp(args->tty_slave, getpgrp()) < 0)
         child_fail("claim private terminal");
@@ -939,6 +970,7 @@ static void inner_session(struct launcher_args *args) {
 }
 
 static void namespace_launcher(struct launcher_args *args) {
+    startup_error_fd = args->session_ready_write;
     if (setgroups(0U, NULL) < 0 || setgid((gid_t)args->uid_base) < 0 ||
         setuid((uid_t)args->uid_base) < 0 ||
         prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 ||
@@ -1290,12 +1322,18 @@ static int create_namespace_session(int socket_fd, int tty_fd,
     }
     close(map_go[1]);
     stage = "wait for isolated user shell";
-    int ready_result = wait_byte(session_ready[0], 'R', 15000);
+    char startup_detail[256] = {0};
+    int ready_result = wait_session_ready(session_ready[0], startup_detail,
+                                          sizeof(startup_detail), 15000);
     close(session_ready[0]);
     if (ready_result < 0) {
         int saved = errno;
         (void)kill(launcher, SIGKILL); (void)waitpid(launcher, NULL, 0);
         cleanup_pins(pin_dir); close(master); errno = saved;
+        if (startup_detail[0] != '\0' && launch_error_size > 0U)
+            (void)snprintf(launch_error, launch_error_size,
+                           "start isolated user shell: %s", startup_detail);
+        if (startup_detail[0] != '\0') return -1;
         return format_launch_error(launch_error, launch_error_size, stage);
     }
     stage = "announce session to login frontend";
