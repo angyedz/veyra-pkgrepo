@@ -19,6 +19,7 @@
 #include <sys/mount.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -521,8 +522,13 @@ static int close_child_fds(void) {
 #ifdef SYS_close_range
     if (syscall(SYS_close_range, 3U, UINT_MAX, 0U) == 0) return 0;
 #endif
-    errno = ENOSYS;
-    return -1;
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) < 0) return -1;
+    rlim_t upper = limit.rlim_cur;
+    if (upper == RLIM_INFINITY || upper > (rlim_t)INT_MAX)
+        upper = (rlim_t)INT_MAX;
+    for (rlim_t fd = 3U; fd < upper; ++fd) (void)close((int)fd);
+    return 0;
 }
 
 static int run_capture(const char *path, char *const argv[],
