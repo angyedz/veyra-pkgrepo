@@ -1,0 +1,103 @@
+pkgname=veyra-user-root-template
+pkgver=3.22.7
+pkgrel=0
+pkgdesc="Sealed Alpine x86_64 root template for isolated Veyra user sessions"
+url="https://github.com/angyedz/veyra-pkgrepo"
+arch="x86_64"
+license="GPL-2.0-only MIT BSD-2-Clause BSD-3-Clause ISC"
+makedepends="apk-tools"
+source="alpine-minirootfs-$pkgver-x86_64.tar.gz::https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-$pkgver-x86_64.tar.gz"
+sha512sums="3d3ce208455c9fa455a85e0c4f1695a292776dccbe8db302b0934f84c0537b2ca201a56c0c150b421f631e54c21bc35a37668e8b33522e844803998692bbc645"
+builddir="$srcdir"
+options="!check"
+
+package() {
+	local root="$pkgdir/usr/share/veyra/user-root-template"
+	mkdir -p "$root"
+	cp -a "$builddir/." "$root/"
+
+	# Keep the template self-contained and signed, but do not run Alpine package
+	# scripts in the host build environment or as part of a future login.
+	apk --root "$root" --no-cache --no-scripts add sudo
+
+	[ -x "$root/sbin/init" ] || return 1
+	[ -x "$root/bin/ash" ] || return 1
+	[ -f "$root/usr/bin/sudo" ] || return 1
+	[ -f "$root/etc/passwd" ] && [ -f "$root/etc/shadow" ] || return 1
+	[ -f "$root/etc/group" ] && [ -f "$root/etc/sudoers" ] || return 1
+	[ ! -L "$root/home" ] || return 1
+	mkdir -p "$root/home/veyrauser" "$root/etc/sudoers.d"
+	[ ! -L "$root/home/veyrauser" ] || return 1
+
+	if awk -F: '$1 == "veyrauser" || $3 == 1000 { found=1 }
+		END { exit !found }' "$root/etc/passwd"; then
+		echo "template already contains the reserved Veyra user" >&2
+		return 1
+	fi
+	if awk -F: '$1 == "veyrauser" || $3 == 1000 { found=1 }
+		END { exit !found }' "$root/etc/group"; then
+		echo "template already contains the reserved Veyra group" >&2
+		return 1
+	fi
+
+	printf '%s\n' 'veyrauser:x:1000:1000:Veyra User:/home/veyrauser:/bin/ash' \
+		>> "$root/etc/passwd"
+	printf '%s\n' 'veyrauser:x:1000:' >> "$root/etc/group"
+	printf '%s\n' 'veyrauser:!:0:0:99999:7:::' >> "$root/etc/shadow"
+	awk -F: -v OFS=: '
+		BEGIN { roots=0 }
+		$1 == "root" { roots++ }
+		{ $2="!"; print }
+		END { if (roots != 1) exit 1 }
+	' "$root/etc/shadow" > "$root/etc/shadow.veyra" || return 1
+	mv "$root/etc/shadow.veyra" "$root/etc/shadow"
+
+	if [ -f "$root/etc/gshadow" ]; then
+		awk -F: -v OFS=: '
+			{ $2="!"; print }
+		' "$root/etc/gshadow" > "$root/etc/gshadow.veyra" || return 1
+		printf '%s\n' 'veyrauser:!::' >> "$root/etc/gshadow.veyra"
+		mv "$root/etc/gshadow.veyra" "$root/etc/gshadow"
+	fi
+	awk -F: '
+		$1 == "veyrauser" && $3 == 1000 && $4 == 1000 &&
+			$6 == "/home/veyrauser" && $7 == "/bin/ash" { found++ }
+		END { exit !(found == 1) }
+	' "$root/etc/passwd" || return 1
+	awk -F: '
+		$1 == "veyrauser" && $3 == 1000 { found++ }
+		END { exit !(found == 1) }
+	' "$root/etc/group" || return 1
+	awk -F: '
+		$1 == "root" && $2 ~ /^[!*]/ { roots++ }
+		$1 == "veyrauser" && $2 == "!" { users++ }
+		$2 !~ /^[!*]/ || $2 == "" { invalid=1 }
+		END { exit !(roots == 1 && users == 1 && !invalid) }
+	' "$root/etc/shadow" || return 1
+	if [ -f "$root/etc/gshadow" ]; then
+		awk -F: '$2 !~ /^[!*]/ || $2 == "" { invalid=1 }
+			END { exit invalid }' "$root/etc/gshadow" || return 1
+		grep -q '^veyrauser:' "$root/etc/gshadow" || return 1
+	fi
+	if grep -R -E -q '^[[:space:]]*[^#].*(NOPASSWD|!authenticate)' \
+		"$root/etc/sudoers" "$root/etc/sudoers.d"; then
+		echo "template contains an active passwordless sudo rule" >&2
+		return 1
+	else
+		[ "$?" -eq 1 ] || return 1
+	fi
+
+	printf '%s\n' 'umask 077' > "$root/home/veyrauser/.profile"
+	printf '%s\n' 'VEYRA-USER-ROOT-TEMPLATE 1' > "$root/.veyra-user-template"
+	chown -hR 0:0 "$root"
+	chmod 0755 "$root"
+	chmod 0644 "$root/.veyra-user-template" "$root/home/veyrauser/.profile"
+	chmod 0700 "$root/home/veyrauser"
+	chmod 0640 "$root/etc/shadow"
+	[ ! -f "$root/etc/gshadow" ] || chmod 0640 "$root/etc/gshadow"
+	chmod 0440 "$root/etc/sudoers"
+	chmod 0750 "$root/etc/sudoers.d"
+
+	install -Dm644 "$startdir/README.md" \
+		"$pkgdir/usr/share/doc/veyra-user-root-template/README.md"
+}

@@ -66,7 +66,7 @@ root:!::
 veyrauser:!::
 wheel:!::veyrauser
 EOF
-printf '%s\n' 'root ALL=(ALL:ALL) ALL' >"$template/etc/sudoers"
+printf '%s\n' '# %wheel ALL=(ALL:ALL) NOPASSWD: ALL' 'root ALL=(ALL:ALL) ALL' >"$template/etc/sudoers"
 printf '%s\n' 'export VEYRA_TEMPLATE_HOME=present' >"$template/home/veyrauser/.profile"
 
 output=$("$script" provision alice)

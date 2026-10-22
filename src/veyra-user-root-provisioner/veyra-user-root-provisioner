@@ -128,14 +128,14 @@ case "$template_mode" in *[!0-7]*|'') fail "template has an invalid mode" ;; esa
 [ -f "$template/etc/sudoers" ] && [ ! -L "$template/etc/sudoers" ] || fail "template sudo policy is unsafe"
 if [ -d "$template/etc/sudoers.d" ]; then
     [ ! -L "$template/etc/sudoers.d" ] || fail "template sudo policy directory is a symlink"
-    if grep -R -E -q 'NOPASSWD|!authenticate' "$template/etc/sudoers" "$template/etc/sudoers.d"; then
+    if grep -R -E -q '^[[:space:]]*[^#].*(NOPASSWD|!authenticate)' "$template/etc/sudoers" "$template/etc/sudoers.d"; then
         fail "template contains a passwordless sudo rule"
     else
         grep_status=$?
         [ "$grep_status" -eq 1 ] || fail "cannot validate template sudo policy"
     fi
 else
-    if grep -E -q 'NOPASSWD|!authenticate' "$template/etc/sudoers"; then
+    if grep -E -q '^[[:space:]]*[^#].*(NOPASSWD|!authenticate)' "$template/etc/sudoers"; then
         fail "template contains a passwordless sudo rule"
     else
         grep_status=$?
