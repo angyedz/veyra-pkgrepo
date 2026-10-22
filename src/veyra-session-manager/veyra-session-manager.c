@@ -696,17 +696,25 @@ static int ensure_run_dir(void) {
     return 0;
 }
 
-static int bind_directory_fd(int fd, const char *target) {
+static int format_pin_error(char *error, size_t error_size,
+                            const char *stage);
+
+static int bind_directory_fd(int fd, const char *target,
+                             const char *open_stage, const char *move_stage,
+                             char *error, size_t error_size) {
     /* Keep the validated directory fd as the mount source across path changes. */
     int tree_fd = (int)syscall(SYS_open_tree, fd, "",
                                AT_EMPTY_PATH | OPEN_TREE_CLONE |
                                OPEN_TREE_CLOEXEC);
-    if (tree_fd < 0) return -1;
+    if (tree_fd < 0)
+        return format_pin_error(error, error_size, open_stage);
     int result = (int)syscall(SYS_move_mount, tree_fd, "", AT_FDCWD,
                               target, MOVE_MOUNT_F_EMPTY_PATH);
     int saved = errno;
     close(tree_fd);
     errno = saved;
+    if (result < 0)
+        return format_pin_error(error, error_size, move_stage);
     return result;
 }
 
@@ -759,10 +767,30 @@ static int prepare_pins(int rootfd, int homefd, uint32_t uid_base,
     if (chown(bootstrap, (uid_t)uid_base, (gid_t)uid_base) < 0) goto fail;
     stage = "set private root staging mode";
     if (chmod(bootstrap, 0700) < 0) goto fail;
-    stage = "bind user root filesystem";
-    if (bind_directory_fd(rootfd, root_pin) < 0) goto fail;
-    stage = "bind persistent home";
-    if (bind_directory_fd(homefd, home_pin) < 0) goto fail;
+    if (bind_directory_fd(rootfd, root_pin,
+                          "open_tree for user root filesystem",
+                          "move_mount for user root filesystem",
+                          error, error_size) < 0) {
+        int saved = errno;
+        (void)umount2(home_pin, MNT_DETACH);
+        (void)umount2(root_pin, MNT_DETACH);
+        (void)rmdir(home_pin); (void)rmdir(root_pin); (void)rmdir(bootstrap);
+        (void)rmdir(pin_dir);
+        errno = saved;
+        return -1;
+    }
+    if (bind_directory_fd(homefd, home_pin,
+                          "open_tree for persistent home",
+                          "move_mount for persistent home",
+                          error, error_size) < 0) {
+        int saved = errno;
+        (void)umount2(home_pin, MNT_DETACH);
+        (void)umount2(root_pin, MNT_DETACH);
+        (void)rmdir(home_pin); (void)rmdir(root_pin); (void)rmdir(bootstrap);
+        (void)rmdir(pin_dir);
+        errno = saved;
+        return -1;
+    }
     return 0;
 fail:
     {
