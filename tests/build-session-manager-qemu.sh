@@ -92,6 +92,7 @@ chmod 0644 "$out/kernel" "$out/initramfs" \
     "$out/system.raw" "$out/user-store.raw"
 
 test -s "$system/etc/pam.d/veyra-login"
+test -s "$system/usr/lib/security/pam_veyra_session.so"
 test -x "$system/usr/sbin/veyra-session-manager"
 test -x "$system/usr/sbin/veyra-user-root-provisioner"
 test -d "$system/usr/share/veyra/user-root-template"

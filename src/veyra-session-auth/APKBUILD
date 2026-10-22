@@ -27,7 +27,7 @@ build() {
 
 package() {
     install -Dm755 "$builddir/pam_veyra_session.so" \
-        "$pkgdir/lib/security/pam_veyra_session.so"
+        "$pkgdir/usr/lib/security/pam_veyra_session.so"
     install -Dm755 "$builddir/veyra-session-grant" \
         "$pkgdir/usr/sbin/veyra-session-grant"
     install -Dm644 "$startdir/pam.d/veyra-login" \
