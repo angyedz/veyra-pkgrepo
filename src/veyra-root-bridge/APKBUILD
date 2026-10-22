@@ -1,0 +1,42 @@
+pkgname=veyra-root-bridge
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Experimental PAM-gated system-root console for Veyra"
+url="https://github.com/angyedz/Veyra-Linux"
+arch="x86_64"
+license="MIT"
+depends="linux-pam"
+makedepends="build-base linux-pam-dev"
+options="!check"
+source=""
+builddir="$srcdir"
+
+build() {
+	${CC:-gcc} ${CPPFLAGS:-} ${CFLAGS:-} -O2 -std=c11 -D_FORTIFY_SOURCE=2 \
+		-fPIE -pie -Wall -Wextra -Werror \
+		-Wl,-z,relro,-z,now \
+		-o "$builddir/veyra-root-console" \
+		"$startdir/veyra-root-console.c" -lpam
+	${CC:-gcc} ${CPPFLAGS:-} ${CFLAGS:-} -O2 -std=c11 -D_FORTIFY_SOURCE=2 \
+		-fPIC -shared -Wall -Wextra -Werror \
+		-Wl,-z,relro,-z,now \
+		-o "$builddir/pam_veyra_root_admin.so" \
+		"$startdir/pam_veyra_root_admin.c" -lpam
+}
+
+package() {
+	install -Dm755 "$builddir/pam_veyra_root_admin.so" \
+		"$pkgdir/usr/lib/security/pam_veyra_root_admin.so"
+	install -Dm755 "$builddir/veyra-root-console" \
+		"$pkgdir/usr/sbin/veyra-root-console"
+	install -Dm644 "$startdir/pam.d/veyra-root-bridge" \
+		"$pkgdir/etc/pam.d/veyra-root-bridge"
+	install -Dm644 "$startdir/README.md" \
+		"$pkgdir/usr/share/doc/veyra-root-bridge/README.md"
+	install -Dm644 "$startdir/tty9-inittab.example" \
+		"$pkgdir/usr/share/doc/veyra-root-bridge/tty9-inittab.example"
+	install -d -m0755 "$pkgdir/etc/veyra"
+	install -m0600 /dev/null "$pkgdir/etc/veyra/root-admins"
+	install -d -m0755 "$pkgdir/var/log/veyra"
+	install -m0600 /dev/null "$pkgdir/var/log/veyra/root-bridge.log"
+}

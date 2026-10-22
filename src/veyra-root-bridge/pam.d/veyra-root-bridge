@@ -1,0 +1,6 @@
+# Separate system-only administration profile. This is never added to global
+# login, SSH, SDDM or the user-root PAM stack.
+auth    requisite pam_unix.so
+account required pam_unix.so
+account required pam_veyra_root_admin.so
+session required pam_unix.so
