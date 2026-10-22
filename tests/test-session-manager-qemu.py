@@ -25,6 +25,11 @@ def authenticate(guest, password):
     guest.sendline(password)
 
 
+def disable_terminal_echo(guest):
+    guest.sendline(b"stty -echo")
+    guest.expect(SHELL, timeout=20)
+
+
 def run_shell_command(guest, command, marker):
     guest.sendline(command)
     guest.expect(marker, timeout=45)
@@ -72,6 +77,7 @@ def main():
 
             authenticate(guest, TEST_PASSWORD)
             guest.expect(SHELL, timeout=90)
+            disable_terminal_echo(guest)
             proof = run_shell_command(
                 guest,
                 b"printf 'VEYRA_QEMU_SESSION_PROOF\\n'; id -u; echo PID=$$; "
@@ -102,6 +108,7 @@ def main():
 
             authenticate(guest, TEST_PASSWORD)
             guest.expect(SHELL, timeout=90)
+            disable_terminal_echo(guest)
             persistence = run_shell_command(
                 guest,
                 b"cat \"$HOME/veyra-qemu-proof\"; echo VEYRA_QEMU_PERSISTENCE_PASS",
