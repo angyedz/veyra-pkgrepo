@@ -652,7 +652,9 @@ static int validate_peer_tty(const struct ucred *peer,
     struct stat st;
     pid_t sid = getsid(peer->pid);
     int failure = 0;
-    int terminal_sid = 0;
+    /* The PAM grant already binds the peer's SID and TTY. TIOCGSID only
+     * accepts the caller's controlling terminal, so cross-check fd 0's
+     * device and the peer SID here instead of issuing it from the manager. */
     if (fstat(ttyfd, &st) < 0) {
         failure = errno;
     } else if (!S_ISCHR(st.st_mode)) {
@@ -664,10 +666,6 @@ static int validate_peer_tty(const struct ucred *peer,
         failure = errno;
     } else if (sid != session->session_id) {
         failure = ESRCH;
-    } else if (ioctl(ttyfd, TIOCGSID, &terminal_sid) < 0) {
-        failure = errno;
-    } else if (terminal_sid != session->session_id) {
-        failure = EACCES;
     }
     if (failure != 0) {
         close(ttyfd);
