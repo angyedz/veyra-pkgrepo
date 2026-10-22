@@ -108,7 +108,10 @@ def send_virtual_keys(monitor, text):
     key_names = {" ": "spc", "-": "minus", "\n": "ret"}
     for character in text:
         key_name = key_names.get(character, character)
-        hmp_command(monitor, b"sendkey " + key_name.encode("ascii"))
+        hmp_command(monitor, b"sendkey " + key_name.encode("ascii") + b" 50")
+        # HMP schedules key release asynchronously; leave enough time before
+        # pressing the next key so guest input cannot merge adjacent strokes.
+        time.sleep(0.1)
 
 
 def wait_for_control_condition(guest, condition, label, timeout=90):
