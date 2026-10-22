@@ -528,16 +528,25 @@ static int validate_rootfs(int rootfd, int homefd,
     return 0;
 }
 
-static int close_child_fds(void) {
+static int close_child_fds(int keep_fd) {
 #ifdef SYS_close_range
-    if (syscall(SYS_close_range, 3U, UINT_MAX, 0U) == 0) return 0;
+    if (keep_fd < 3) {
+        if (syscall(SYS_close_range, 3U, UINT_MAX, 0U) == 0) return 0;
+    } else if (keep_fd == 3) {
+        if (syscall(SYS_close_range, 4U, UINT_MAX, 0U) == 0) return 0;
+    } else if (syscall(SYS_close_range, 3U, (unsigned)keep_fd - 1U, 0U) == 0 &&
+               syscall(SYS_close_range, (unsigned)keep_fd + 1U,
+                       UINT_MAX, 0U) == 0) {
+        return 0;
+    }
 #endif
     struct rlimit limit;
     if (getrlimit(RLIMIT_NOFILE, &limit) < 0) return -1;
     rlim_t upper = limit.rlim_cur;
     if (upper == RLIM_INFINITY || upper > (rlim_t)INT_MAX)
         upper = (rlim_t)INT_MAX;
-    for (rlim_t fd = 3U; fd < upper; ++fd) (void)close((int)fd);
+    for (rlim_t fd = 3U; fd < upper; ++fd)
+        if ((int)fd != keep_fd) (void)close((int)fd);
     return 0;
 }
 
@@ -563,7 +572,7 @@ static int run_capture(const char *path, char *const argv[],
             _exit(126);
         if (nullfd > STDERR_FILENO) close(nullfd);
         close(pipefd[1]);
-        if (close_child_fds() < 0) _exit(126);
+        if (close_child_fds(-1) < 0) _exit(126);
         char *const envp[] = { (char *)"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
                                (char *)"LC_ALL=C", NULL };
         execve(path, argv, envp);
@@ -944,7 +953,8 @@ static void inner_session(struct launcher_args *args) {
     if (setgid(1000U) < 0 || setuid(1000U) < 0)
         child_fail("drop to the user account");
     (void)prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-    if (close_child_fds() < 0) child_fail("close inherited system descriptors");
+    if (close_child_fds(args->session_ready_write) < 0)
+        child_fail("close inherited system descriptors");
     char argv0[PATH_MAX];
     const char *base = strrchr(args->shell, '/');
     base = base == NULL ? args->shell : base + 1;
@@ -965,6 +975,7 @@ static void inner_session(struct launcher_args *args) {
     if (write_all(args->session_ready_write, "R", 1U) < 0)
         child_fail("signal session readiness");
     close(args->session_ready_write);
+    startup_error_fd = -1;
     execve(args->shell, shell_argv, envp);
     child_fail("start user login shell");
 }
