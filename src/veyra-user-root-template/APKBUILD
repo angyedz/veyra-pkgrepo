@@ -21,6 +21,9 @@ package() {
 	# Keep the template self-contained and signed, but do not run Alpine package
 	# scripts in the host build environment or as part of a future login.
 	apk --root "$root" --no-cache --no-scripts add sudo
+	# These paths are mount points inside each isolated user root. Some Alpine
+	# minirootfs releases omit empty directories such as /dev/pts from the tarball.
+	mkdir -p "$root/dev/pts" "$root/proc" "$root/run" "$root/tmp"
 	# abuild rejects setuid files. The system-side provisioner grants the bit
 	# only after assigning the account's mapped ownership to its private root.
 	chmod u-s "$root/usr/bin/sudo"
