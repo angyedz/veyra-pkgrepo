@@ -67,11 +67,11 @@ def connect_serial(path, logfile, timeout=45):
     raise RuntimeError(f"QEMU serial socket did not become available: {path}")
 
 
-def login_user(guest, account, password, timeout=90):
+def login_user(guest, account, password, timeout=90, context=""):
     wait_for_login(
         guest,
         timeout=timeout,
-        context=f"for {account.decode('ascii')}",
+        context=context or f"for {account.decode('ascii')}",
     )
     authenticate(guest, account, password)
     guest.expect(SHELL, timeout=timeout)
@@ -226,8 +226,13 @@ def main():
                 # Normal logout also closes the session and returns to the
                 # system login prompt without losing the account's home.
                 guest1.sendline(b"exit")
-                wait_for_login(guest1, timeout=90, context="after user logout")
-                login_user(guest1, TEST_USERS[1][0], TEST_USERS[1][1], timeout=90)
+                login_user(
+                    guest1,
+                    TEST_USERS[1][0],
+                    TEST_USERS[1][1],
+                    timeout=90,
+                    context="after user logout",
+                )
                 prove_persistent_home(guest1, TEST_USERS[1][0])
 
                 guest0.sendline(b"exit")
