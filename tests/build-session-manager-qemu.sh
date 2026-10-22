@@ -83,6 +83,9 @@ ln -s /etc/init.d/veyra-session-qemu-enroll \
 ln -s /etc/init.d/veyra-session-manager \
     "$system/etc/runlevels/default/veyra-session-manager"
 mkdir -p "$system/usr/local/sbin"
+cc -static -Wall -Wextra -Werror \
+    -o "$system/usr/local/sbin/veyra-qemu-tty-inject" \
+    "$root/tests/qemu-tty-inject.c"
 for tty in ttyS0 ttyS1; do
     cat > "$system/usr/local/sbin/veyra-qemu-login-$tty" <<EOF
 #!/bin/sh
