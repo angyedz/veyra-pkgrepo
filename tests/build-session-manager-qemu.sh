@@ -46,7 +46,7 @@ apk --root "$system" \
 chroot "$system" addgroup -g 23150 veyraqa
 chroot "$system" adduser -D -H -u 23150 -G veyraqa \
     -s /sbin/nologin veyraqa
-printf '%s:%s\n' veyraqa 'Veyra-Session-QEMU-2026!' |
+printf '%s:%s\n' veyraqa 'veyraqa2026' |
     chroot "$system" chpasswd
 chroot "$system" addgroup -g 23151 veyraqa2
 chroot "$system" adduser -D -H -u 23151 -G veyraqa2 \
@@ -92,6 +92,12 @@ exec /usr/sbin/veyra-login
 EOF
     chmod 0755 "$system/usr/local/sbin/veyra-qemu-login-$tty"
 done
+cat > "$system/usr/local/sbin/veyra-qemu-login-tty1" <<'EOF'
+#!/bin/sh
+stty sane
+exec /usr/sbin/veyra-login
+EOF
+chmod 0755 "$system/usr/local/sbin/veyra-qemu-login-tty1"
 cat > "$system/etc/inittab" <<'EOF'
 ::sysinit:/sbin/openrc sysinit
 ::sysinit:/sbin/openrc boot
@@ -100,6 +106,7 @@ cat > "$system/etc/inittab" <<'EOF'
 ttyS0::respawn:/usr/local/sbin/veyra-qemu-login-ttyS0
 ttyS1::respawn:/usr/local/sbin/veyra-qemu-login-ttyS1
 ttyS2::respawn:/bin/sh -l
+tty1::respawn:/usr/local/sbin/veyra-qemu-login-tty1
 EOF
 
 truncate -s 768M "$out/system.raw"

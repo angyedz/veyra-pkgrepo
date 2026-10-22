@@ -20,7 +20,7 @@ LOGIN = re.compile(
 PASSWORD = re.compile(rb"(?i)password:\s*$")
 SHELL = re.compile(rb"[$#] ")
 TEST_USERS = (
-    (b"veyraqa", b"Veyra-Session-QEMU-2026!", 300000),
+    (b"veyraqa", b"veyraqa2026", 300000),
     (b"veyraqa2", b"Veyra-Session-QEMU-Second-2026!", 400000),
 )
 
@@ -65,6 +65,115 @@ def connect_serial(path, logfile, timeout=45):
             connection.close()
             time.sleep(0.1)
     raise RuntimeError(f"QEMU serial socket did not become available: {path}")
+
+
+def read_hmp_response(monitor, timeout=10):
+    deadline = time.monotonic() + timeout
+    response = bytearray()
+    while b"(qemu) " not in response:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("QEMU monitor did not return its prompt")
+        monitor.settimeout(remaining)
+        chunk = monitor.recv(4096)
+        if not chunk:
+            raise RuntimeError("QEMU monitor disconnected")
+        response.extend(chunk)
+    return bytes(response)
+
+
+def connect_hmp_monitor(path, timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        monitor = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            monitor.connect(str(path))
+            read_hmp_response(monitor)
+            return monitor
+        except (FileNotFoundError, ConnectionRefusedError):
+            monitor.close()
+            time.sleep(0.1)
+    raise RuntimeError(f"QEMU monitor socket did not become available: {path}")
+
+
+def hmp_command(monitor, command):
+    monitor.sendall(command + b"\n")
+    response = read_hmp_response(monitor)
+    if b"unknown key" in response.lower() or b"error:" in response.lower():
+        raise RuntimeError(f"QEMU monitor rejected command: {response!r}")
+    return response
+
+
+def send_virtual_keys(monitor, text):
+    key_names = {" ": "spc", "-": "minus", "\n": "ret"}
+    for character in text:
+        key_name = key_names.get(character, character)
+        hmp_command(monitor, b"sendkey " + key_name.encode("ascii"))
+
+
+def wait_for_control_condition(guest, condition, label, timeout=90):
+    marker = f"VEYRA_CONTROL_CONDITION_PASS_{label}".encode("ascii")
+    failed = f"VEYRA_CONTROL_CONDITION_FAIL_{label}".encode("ascii")
+    limit = str(timeout).encode("ascii")
+    command = (
+        b"i=0; while test \"$i\" -lt " + limit + b"; do if " + condition +
+        b"; then echo " + marker + b"; break; fi; sleep 1; i=$((i+1)); done; "
+        b"test \"$i\" -lt " + limit + b" || echo " + failed
+    )
+    guest.sendline(command)
+    outcome = guest.expect([marker, failed], timeout=timeout + 20)
+    guest.expect(SHELL, timeout=20)
+    if outcome != 0:
+        raise RuntimeError(f"timed out waiting for QEMU guest condition: {label}")
+
+
+def wait_for_vt(guest, number, timeout=90):
+    device = f"tty{number}".encode("ascii")
+    condition = b"test \"$(cat /sys/class/tty/tty0/active 2>/dev/null)\" = " + device
+    wait_for_control_condition(guest, condition, f"active_vt_{number}", timeout)
+
+
+def wait_for_console_text(guest, number, text, timeout=90):
+    device = f"/dev/vcs{number}".encode("ascii")
+    quoted_text = b"'" + text.encode("ascii") + b"'"
+    condition = b"grep -aF -q " + quoted_text + b" " + device
+    label = re.sub(
+        r"[^A-Za-z0-9_]+", "_",
+        f"console_text_vt{number}_{text.split()[0].lower()}",
+    )
+    wait_for_control_condition(guest, condition, label, timeout)
+
+
+def prove_root_bridge_success(monitor, control):
+    # A real system virtual terminal is required; the serial sessions above
+    # must remain ineligible even though the same account is allowlisted.
+    wait_for_vt(control, 1)
+    wait_for_console_text(control, 1, "login:")
+    send_virtual_keys(monitor, "veyraqa\n")
+    wait_for_console_text(control, 1, "Password:")
+    send_virtual_keys(monitor, TEST_USERS[0][1].decode("ascii") + "\n")
+    wait_for_console_text(control, 1, "$", timeout=120)
+    send_virtual_keys(monitor, "veyra-root-request\n")
+    wait_for_vt(control, 9)
+    wait_for_console_text(control, 9, "System administrator account:")
+    send_virtual_keys(monitor, "veyraqa\n")
+    wait_for_console_text(control, 9, "Password:")
+    send_virtual_keys(monitor, TEST_USERS[0][1].decode("ascii") + "\n")
+    wait_for_console_text(control, 9, "Authenticated. Entering the system root shell.")
+    send_virtual_keys(monitor, "id\n")
+    wait_for_console_text(control, 9, "uid=0(root)")
+    send_virtual_keys(monitor, "exit\n")
+    wait_for_vt(control, 1)
+    wait_for_console_text(control, 1, "System administrator console closed.")
+    proof = run_shell_command(
+        control,
+        b"grep -q 'outcome=success user=veyraqa tty=/dev/tty9' "
+        b"/var/log/veyra/root-bridge.log && echo "
+        b"VEYRA_ROOT_BRIDGE_AUTHORIZED_QEMU_PASS",
+        b"VEYRA_ROOT_BRIDGE_AUTHORIZED_QEMU_PASS",
+    )
+    if b"VEYRA_ROOT_BRIDGE_AUTHORIZED_QEMU_PASS" not in proof:
+        raise RuntimeError("the successful system-root PAM login was not audited")
 
 
 def login_user(guest, account, password, timeout=90, context=""):
@@ -173,15 +282,19 @@ def main():
     with tempfile.TemporaryDirectory(prefix="veyra-session-qemu-") as socket_dir:
         tty1_socket = pathlib.Path(socket_dir) / "ttyS1.sock"
         tty2_socket = pathlib.Path(socket_dir) / "ttyS2.sock"
+        monitor_socket = pathlib.Path(socket_dir) / "monitor.sock"
         command = [
             "-machine", "q35,accel=tcg", "-m", "1024", "-smp", "2",
-            "-nodefaults", "-nographic", "-no-reboot",
+            "-nodefaults", "-display", "none", "-no-reboot",
+            "-device", "VGA",
+            "-device", "qemu-xhci,id=xhci",
+            "-device", "usb-kbd,bus=xhci.0",
             "-serial", "stdio",
             "-chardev", f"socket,id=serial1,path={tty1_socket},server=on,wait=off",
             "-serial", "chardev:serial1",
             "-chardev", f"socket,id=serial2,path={tty2_socket},server=on,wait=off",
             "-serial", "chardev:serial2",
-            "-monitor", "none",
+            "-monitor", f"unix:{monitor_socket},server=on,wait=off",
             "-kernel", str(args.kernel.resolve()),
             "-initrd", str(args.initramfs.resolve()),
             "-drive", f"file={args.system_disk.resolve()},if=virtio,format=raw,cache=writeback",
@@ -195,9 +308,11 @@ def main():
             guest0.logfile_read = log0
             guest1 = None
             guest2 = None
+            monitor = None
             try:
                 guest1 = connect_serial(tty1_socket, log1)
                 guest2 = connect_serial(tty2_socket, log2)
+                monitor = connect_hmp_monitor(monitor_socket)
 
                 # The system login service rejects a bad password before it
                 # starts either account's isolated environment.
@@ -223,6 +338,10 @@ def main():
                 # the user-facing sessions above still use PAM login.
                 guest2.expect(SHELL, timeout=90)
                 disable_terminal_echo(guest2)
+
+                # A managed user on a real virtual terminal must be able to
+                # authenticate at VT9, receive a root shell, and return to VT1.
+                prove_root_bridge_success(monitor, guest2)
 
                 # Killing the host-owned login frontend simulates an
                 # unexpected terminal/client disconnect while its user shell
@@ -276,14 +395,17 @@ def main():
                     guest1.close()
                 if guest2 is not None:
                     guest2.close()
+                if monitor is not None:
+                    monitor.close()
                 guest0.close(force=True)
 
     print(
         "VEYRA_SESSION_MANAGER_QEMU_PASS: wrong password rejected; two ordinary system "
         "accounts ran concurrently in separate mapped roots; an allowlisted serial-TTY "
         "request and an unlisted account's request could not trigger the system-root "
-        "console; client disconnect, manager restart and logout ended sessions; both "
-        "separate homes persisted"
+        "console; the authorized VT9 PAM login opened a UID 0 shell and restored VT1; "
+        "client disconnect, manager restart and logout ended sessions; both separate "
+        "homes persisted"
     )
 
 
