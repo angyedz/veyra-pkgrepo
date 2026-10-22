@@ -1,7 +1,7 @@
 pkgname=veyra-update
 pkgver=0.1.0
-pkgrel=0
-pkgdesc="Veyra Linux update utility"
+pkgrel=1
+pkgdesc="Veyra Linux updater with atomic deployment routing"
 url="https://github.com/angyedz/Veyra-Linux"
 arch="noarch"
 license="MIT"
@@ -11,5 +11,5 @@ source=""
 builddir="$srcdir"
 package() {
     install -Dm755 "$startdir/$pkgname" "$pkgdir/usr/bin/$pkgname"
-
+    install -Dm644 "$startdir/README.md" "$pkgdir/usr/share/doc/veyra-update/README.md"
 }

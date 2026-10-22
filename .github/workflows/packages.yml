@@ -26,7 +26,11 @@ jobs:
           path: distro-source
           persist-credentials: false
       - name: Install tools
-        run: apk add --no-cache alpine-sdk go git openssl ca-certificates && apk update
+        run: apk add --no-cache alpine-sdk go git openssl ca-certificates python3 && apk update
+      - name: Test application catalog and safe package parsing
+        run: python3 -m unittest discover -s tests -p 'test_appcenter_backend.py'
+      - name: Test atomic system update routing
+        run: sh tests/test_veyra_update.sh
       - name: Test vpkg
         run: cd distro-source/vpkg && go test ./... && go vet ./...
       - name: Configure isolated builder and signing
