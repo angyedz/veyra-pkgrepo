@@ -689,7 +689,7 @@ static int ensure_run_dir(void) {
 
 static int bind_directory_fd(int fd, const char *target) {
     char source[64];
-    int length = snprintf(source, sizeof(source), "/proc/self/fd/%d", fd);
+    int length = snprintf(source, sizeof(source), "/proc/self/fd/%d/", fd);
     if (length < 0 || length >= (int)sizeof(source)) { errno = EINVAL; return -1; }
     return mount(source, target, NULL, MS_BIND, NULL);
 }
