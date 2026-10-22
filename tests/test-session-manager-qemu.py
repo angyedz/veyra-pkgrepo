@@ -144,7 +144,22 @@ def wait_for_console_text(guest, number, text, timeout=90):
         r"[^A-Za-z0-9_]+", "_",
         f"console_text_vt{number}_{text.split()[0].lower()}",
     )
-    wait_for_control_condition(guest, condition, label, timeout)
+    try:
+        wait_for_control_condition(guest, condition, label, timeout)
+    except RuntimeError:
+        marker = f"VEYRA_VT{number}_SCREEN_CAPTURE_END".encode("ascii")
+        dump = run_shell_command(
+            guest,
+            b"cat " + device + b" | tr -d '\\000' | fold -w 80 | tail -n 5; "
+            b"echo " + marker,
+            marker,
+        )
+        print(
+            f"VEYRA_VT{number}_SCREEN_CAPTURE: {dump!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
 
 
 def prove_root_bridge_success(monitor, control):
