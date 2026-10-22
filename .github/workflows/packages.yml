@@ -76,8 +76,10 @@ jobs:
           QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software timeout 8s veyra-appcenter > /tmp/veyra-appcenter.log 2>&1
           status=$?
           set -e
-          test "$status" -eq 124
+          cat /tmp/veyra-appcenter.log
           grep -q 'VEYRA_QML_READY' /tmp/veyra-appcenter.log
+          # Alpine's BusyBox timeout returns 143 when it stops a healthy GUI.
+          test "$status" -eq 124 || test "$status" -eq 143
       - uses: actions/upload-artifact@v4
         with:
           name: veyra-apks-${{ github.sha }}
