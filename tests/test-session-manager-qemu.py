@@ -25,8 +25,12 @@ TEST_USERS = (
 )
 
 
-def wait_for_login(guest, timeout=240):
-    guest.expect(LOGIN, timeout=timeout)
+def wait_for_login(guest, timeout=240, context=""):
+    try:
+        guest.expect(LOGIN, timeout=timeout)
+    except pexpect.TIMEOUT as error:
+        label = f" {context}" if context else ""
+        raise RuntimeError(f"timed out waiting for login prompt{label}") from error
 
 
 def authenticate(guest, account, password):
@@ -64,7 +68,11 @@ def connect_serial(path, logfile, timeout=45):
 
 
 def login_user(guest, account, password, timeout=90):
-    wait_for_login(guest, timeout=timeout)
+    wait_for_login(
+        guest,
+        timeout=timeout,
+        context=f"for {account.decode('ascii')}",
+    )
     authenticate(guest, account, password)
     guest.expect(SHELL, timeout=timeout)
     disable_terminal_echo(guest)
@@ -218,12 +226,12 @@ def main():
                 # Normal logout also closes the session and returns to the
                 # system login prompt without losing the account's home.
                 guest1.sendline(b"exit")
-                wait_for_login(guest1, timeout=90)
+                wait_for_login(guest1, timeout=90, context="after user logout")
                 login_user(guest1, TEST_USERS[1][0], TEST_USERS[1][1], timeout=90)
                 prove_persistent_home(guest1, TEST_USERS[1][0])
 
                 guest0.sendline(b"exit")
-                wait_for_login(guest0, timeout=90)
+                wait_for_login(guest0, timeout=90, context="after first user logout")
             finally:
                 if guest1 is not None:
                     guest1.close()

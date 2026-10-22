@@ -82,6 +82,7 @@ mkdir -p "$system/usr/local/sbin"
 for tty in ttyS0 ttyS1; do
     cat > "$system/usr/local/sbin/veyra-qemu-login-$tty" <<EOF
 #!/bin/sh
+stty sane
 printf '%s\\n' "\$\$" > /run/veyra-qemu-login-$tty.pid
 exec /usr/sbin/veyra-login
 EOF
