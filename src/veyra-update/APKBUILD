@@ -1,11 +1,11 @@
 pkgname=veyra-update
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Veyra Linux updater and signed paired-generation transaction helper"
 url="https://github.com/angyedz/Veyra-Linux"
 arch="x86_64"
 license="MIT"
-depends="apk-tools ca-certificates grub mkinitfs python3 rsync"
+depends="apk-tools ca-certificates grub mkinitfs python3 rsync util-linux"
 makedepends="go"
 options="!check"
 source=""
