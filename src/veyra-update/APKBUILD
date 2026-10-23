@@ -1,15 +1,43 @@
 pkgname=veyra-update
 pkgver=0.1.0
-pkgrel=1
-pkgdesc="Veyra Linux updater with atomic deployment routing"
+pkgrel=2
+pkgdesc="Veyra Linux updater and signed paired-generation transaction helper"
 url="https://github.com/angyedz/Veyra-Linux"
-arch="noarch"
+arch="x86_64"
 license="MIT"
-depends="apk-tools"
+depends="apk-tools ca-certificates grub mkinitfs python3 rsync"
+makedepends="go"
 options="!check"
 source=""
 builddir="$srcdir"
+
+build() {
+    veyra_source="$startdir/../../distro-source"
+    [ -f "$veyra_source/update/go.mod" ] || {
+        echo 'Veyra-Linux update source checkout is missing' >&2
+        return 1
+    }
+    (
+        cd "$veyra_source/update"
+        CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+            -o "$srcdir/veyra-atomic-update" ./cmd/veyra-atomic-update
+        CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+            -o "$srcdir/veyra-update-verify" ./cmd/veyra-update-verify
+    )
+}
+
 package() {
     install -Dm755 "$startdir/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm755 "$srcdir/veyra-atomic-update" "$pkgdir/usr/sbin/veyra-atomic-update"
+    install -Dm755 "$srcdir/veyra-update-verify" "$pkgdir/usr/bin/veyra-update-verify"
     install -Dm644 "$startdir/README.md" "$pkgdir/usr/share/doc/veyra-update/README.md"
+    veyra_source="$startdir/../../distro-source"
+    install -Dm755 "$veyra_source/scripts/veyra-bootctl.py" \
+        "$pkgdir/usr/local/sbin/veyra-bootctl"
+    for script in veyra-deployment.sh veyra-initramfs-select.sh build-veyra-init.sh; do
+        install -Dm755 "$veyra_source/scripts/$script" \
+            "$pkgdir/usr/local/lib/veyra/$script"
+    done
+    install -Dm755 "$veyra_source/scripts/veyra-boot-confirm.initd" \
+        "$pkgdir/etc/init.d/veyra-boot-confirm"
 }

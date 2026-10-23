@@ -23,6 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: angyedz/Veyra-Linux
+          ref: 6be0cf099880f1b5118e5f52d49ec503150079d1
           path: distro-source
           persist-credentials: false
       - name: Install tools
@@ -33,6 +34,8 @@ jobs:
         run: sh tests/test_veyra_update.sh
       - name: Test vpkg
         run: cd distro-source/vpkg && go test ./... && go vet ./...
+      - name: Test signed paired-update engine
+        run: cd distro-source/update && go test ./... && go vet ./...
       - name: Configure isolated builder and signing
         env:
           VEYRA_KEY_B64: ${{ secrets.VEYRA_ABUILD_PRIVATE_KEY_B64 }}
