@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: angyedz/Veyra-Linux
-          ref: 6be0cf099880f1b5118e5f52d49ec503150079d1
+          ref: bed990145ed03d04a9bcbb0e074e92ae7e6aec26
           path: distro-source
           persist-credentials: false
       - name: Install tools

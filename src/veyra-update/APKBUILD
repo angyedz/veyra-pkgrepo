@@ -33,10 +33,10 @@ package() {
     install -Dm644 "$startdir/README.md" "$pkgdir/usr/share/doc/veyra-update/README.md"
     veyra_source="$startdir/../../distro-source"
     install -Dm755 "$veyra_source/scripts/veyra-bootctl.py" \
-        "$pkgdir/usr/local/sbin/veyra-bootctl"
+        "$pkgdir/usr/libexec/veyra/bootctl"
     for script in veyra-deployment.sh veyra-initramfs-select.sh build-veyra-init.sh; do
         install -Dm755 "$veyra_source/scripts/$script" \
-            "$pkgdir/usr/local/lib/veyra/$script"
+            "$pkgdir/usr/libexec/veyra/$script"
     done
     install -Dm755 "$veyra_source/scripts/veyra-boot-confirm.initd" \
         "$pkgdir/etc/init.d/veyra-boot-confirm"
