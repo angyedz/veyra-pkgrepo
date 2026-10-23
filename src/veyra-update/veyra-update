@@ -1,11 +1,66 @@
 #!/bin/sh
 set -eu
-if [ "${1:-}" = "--check" ]; then
+
+usage() {
+  echo 'usage: veyra-update [--check]' >&2
+  exit 2
+}
+
+case "$#:${1:-}" in
+  0:) action=upgrade ;;
+  1:--check) action=check ;;
+  *) usage ;;
+esac
+
+if [ "$action" = upgrade ] && [ "$(id -u)" -ne 0 ]; then
+  echo "Run sudo veyra-update" >&2
+  exit 1
+fi
+
+# These two path overrides are test seams. This guard prevents accidental
+# in-place upgrades; root can bypass it with apk directly, so it is not the
+# system/user privilege boundary.
+mode_file=${VEYRA_UPDATE_MODE_FILE:-/etc/veyra/deployment-mode}
+atomic_updater=${VEYRA_UPDATE_ATOMIC_HELPER:-/usr/sbin/veyra-atomic-update}
+mode_dir=${mode_file%/*}
+if [ -L "$mode_dir" ] || [ -L "$mode_file" ]; then
+  echo 'veyra-update: deployment mode path is unsafe; refusing update' >&2
+  exit 1
+fi
+
+if [ -e "$mode_file" ]; then
+  [ -f "$mode_file" ] || {
+    echo 'veyra-update: deployment mode is not a regular file; refusing update' >&2
+    exit 1
+  }
+  mode=$(cat "$mode_file") || {
+    echo 'veyra-update: cannot read deployment mode; refusing update' >&2
+    exit 1
+  }
+  case "$mode" in
+    atomic-v1)
+      if [ -x "$atomic_updater" ] && [ ! -L "$atomic_updater" ]; then
+        if [ "$action" = check ]; then
+          exec "$atomic_updater" --check
+        fi
+        exec "$atomic_updater"
+      fi
+      echo 'veyra-update: A/B update helper is not installed; refusing in-place APK upgrade' >&2
+      exit 1
+      ;;
+    *)
+      echo "veyra-update: unsupported deployment mode '$mode'; refusing update" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [ "$action" = check ]; then
   apk update
   apk list -u
   exit
 fi
-[ "$(id -u)" -eq 0 ] || { echo "Run sudo veyra-update" >&2; exit 1; }
+
 apk update
 apk upgrade
 echo "Alpine and Veyra APK packages updated. For user Nix packages run: vpkg upgrade --from nix"
