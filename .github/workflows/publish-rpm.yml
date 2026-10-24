@@ -30,6 +30,9 @@ jobs:
     timeout-minutes: 30
     container: fedora:44
     steps:
+      - name: Install Git for source checkout
+        run: dnf -y install git
+
       - uses: actions/checkout@v4
         with:
           ref: main
