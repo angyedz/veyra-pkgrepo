@@ -2,14 +2,14 @@ name: Veyra RPM package checks
 
 on:
   push:
-    branches: [testing, stable]
+    branches: [main]
     paths:
       - 'rpms/**'
       - 'scripts/**'
       - '.github/workflows/**'
       - 'README.md'
   pull_request:
-    branches: [testing, stable]
+    branches: [main]
     paths:
       - 'rpms/**'
       - 'scripts/**'

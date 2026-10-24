@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-output_dir=${1:-"$repo_root/repo/x86_64"}
+output_dir=${1:-"$repo_root/repo/testing/x86_64"}
 if [[ "$output_dir" != /* ]]; then
   output_dir="$repo_root/$output_dir"
 fi
