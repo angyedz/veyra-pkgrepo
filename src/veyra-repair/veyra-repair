@@ -1,8 +1,0 @@
-#!/bin/sh
-set -eu
-case "${1:-help}" in
-check) apk audit --system || :; apk fix --simulate ;;
-packages) [ "$(id -u)" -eq 0 ] || { echo 'Requires root' >&2; exit 1; }; apk fix ;;
-help) echo 'veyra-repair check | packages'; echo 'check is non-destructive; packages repairs installed APK dependencies.' ;;
-*) exit 2 ;;
-esac

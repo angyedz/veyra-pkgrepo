@@ -1,0 +1,91 @@
+name: Publish Veyra RPM repository
+
+on:
+  push:
+    branches: [testing, stable]
+    paths:
+      - 'rpms/**'
+      - 'scripts/**'
+      - '.github/workflows/publish-rpm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: veyra-rpm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref_name == 'testing' || github.ref_name == 'stable'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Install RPM repository tools
+        run: dnf -y install rpm-build rpm-sign createrepo_c gnupg2 dnf git findutils coreutils
+
+      - name: Import RPM signing key or prepare a CI-only key
+        id: signing
+        env:
+          GNUPGHOME: ${{ runner.temp }}/veyra-rpm-gnupg
+          VEYRA_RPM_GPG_PRIVATE_KEY_B64: ${{ secrets.VEYRA_RPM_GPG_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$GNUPGHOME"
+          if [ -n "$VEYRA_RPM_GPG_PRIVATE_KEY_B64" ]; then
+            key_file="$RUNNER_TEMP/veyra-rpm-private-key.asc"
+            printf '%s' "$VEYRA_RPM_GPG_PRIVATE_KEY_B64" | base64 --decode > "$key_file"
+            chmod 0600 "$key_file"
+            gpg --batch --import "$key_file"
+            rm -f "$key_file"
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          else
+            gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+              --quick-generate-key "Veyra CI ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" rsa3072 sign 1d
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          fi
+          fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+          test -n "$fingerprint"
+          echo "VEYRA_RPM_GPG_FINGERPRINT=$fingerprint" >> "$GITHUB_ENV"
+
+      - name: Build signed Veyra-only RPM repository
+        env:
+          GNUPGHOME: ${{ runner.temp }}/veyra-rpm-gnupg
+        run: bash scripts/build-rpm-repo.sh "$RUNNER_TEMP/veyra-repo/x86_64"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veyra-${{ github.ref_name }}-rpm-repository-${{ github.sha }}
+          path: ${{ runner.temp }}/veyra-repo/x86_64/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish repository snapshot to this channel branch
+        if: steps.signing.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p repo
+          rm -rf repo/x86_64
+          cp -a "$RUNNER_TEMP/veyra-repo/x86_64" repo/x86_64
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add repo/x86_64
+          if git diff --cached --quiet; then
+            echo 'Repository snapshot is already current.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "packages: publish signed Veyra RPM snapshot (${GITHUB_REF_NAME})"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Explain skipped publication
+        if: steps.signing.outputs.publish != 'true'
+        run: |
+          echo 'Signed repository publication skipped: add VEYRA_RPM_GPG_PRIVATE_KEY_B64 as an Actions secret.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The workflow built and signed a temporary CI artifact only.' >> "$GITHUB_STEP_SUMMARY"

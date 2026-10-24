@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-echo 'Detected display adapters:'
-if command -v lspci >/dev/null; then lspci | grep -iE 'vga|3d|display' || :; else echo 'pciutils not installed'; fi
-echo 'Current kernel graphics modules:'
-lsmod | grep -E '^(nouveau|nvidia|amdgpu|radeon|i915|xe|vmwgfx|vboxvideo)' || :
-echo 'No drivers are installed automatically. Use distribution-approved packages for your hardware.'

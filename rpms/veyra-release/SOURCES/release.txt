@@ -1,0 +1,3 @@
+Veyra Linux pre-alpha
+Experimental release channel
+Fedora provides the base system packages; Veyra packages are maintained separately.

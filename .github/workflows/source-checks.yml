@@ -1,70 +1,42 @@
-name: Package source checks
+name: Veyra RPM source checks
+
 on:
   push:
+    branches: [testing, stable]
     paths:
-      - 'src/**'
-      - 'branding/**'
-      - 'tests/**'
+      - 'rpms/**'
+      - 'scripts/**'
       - '.github/workflows/source-checks.yml'
+      - '.github/workflows/packages.yml'
   pull_request:
+    branches: [testing, stable]
     paths:
-      - 'src/**'
-      - 'branding/**'
-      - 'tests/**'
+      - 'rpms/**'
+      - 'scripts/**'
+      - '.github/workflows/source-checks.yml'
+      - '.github/workflows/packages.yml'
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: fedora:44
     steps:
       - uses: actions/checkout@v4
-      - name: Validate package recipes and script syntax
+      - name: Install spec parser
+        run: dnf -y install rpm-build bash
+      - name: Validate package specs and build script
         run: |
-          set -eu
-          apk add --no-cache python3
-          for recipe in src/*/APKBUILD; do
-            sh -n "$recipe"
-            echo "Validated $recipe"
+          set -euo pipefail
+          bash -n scripts/build-rpm-repo.sh
+          shopt -s nullglob
+          specs=(rpms/*/*.spec)
+          test "${#specs[@]}" -gt 0
+          for spec in "${specs[@]}"; do
+            rpmspec --parse "$spec" >/dev/null
+            echo "Validated $spec"
           done
-          for script in src/*/veyra-*; do
-            [ -f "$script" ] || continue
-            case "$script" in *.desktop|*/APKBUILD) continue ;; esac
-            case "$(head -n 1 "$script")" in
-              *python*) python3 -m py_compile "$script" ;;
-              '#!'*'/sh'*|'#!'*'/bash'*) sh -n "$script" ;;
-            esac
-          done
-          python3 -m py_compile src/veyra-appcenter/backend.py
-          test -s src/veyra-appcenter/main.qml
-          test -s branding/veyra-logo.svg
-          test -s branding/fastfetch/logo.txt
-      - name: Unit tests for package parsing and command validation
-        run: python3 -m unittest discover -s tests -v
-      - name: Check GUI dependencies exist in Alpine repositories
-        run: |
-          apk update
-          apk add --no-cache python3 py3-qt6 qt6-qtdeclarative polkit
-      - name: Launch Qt Quick frontend in headless mode
-        run: |
-          set +e
-          QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software timeout 6s python3 src/veyra-appcenter/veyra-appcenter > /tmp/veyra-qml.log 2>&1
-          result=$?
-          set -e
-          cat /tmp/veyra-qml.log
-          # A healthy GUI stays alive until timeout; QML import errors exit early.
-          grep -q 'VEYRA_QML_READY' /tmp/veyra-qml.log
-          test "$result" -eq 124 || test "$result" -eq 143
-      - name: Verify curated app names exist in pinned Alpine Stable
-        run: |
-          set -eu
-          apk update
-          python3 -c 'import sys; sys.path.insert(0, "src/veyra-appcenter"); from backend import FEATURED_APPS; print(*(x[0] for x in FEATURED_APPS), sep=chr(10))' > /tmp/veyra-featured
-          while IFS= read -r name; do
-            [ -n "$name" ] || continue
-            apk search -q -x "$name" | grep -Fqx "$name" || {
-              echo "Curated package missing from Alpine 3.22: $name" >&2
-              exit 1
-            }
-          done < /tmp/veyra-featured
+          test -s rpms/veyra-release/SOURCES/release.txt
