@@ -41,7 +41,7 @@ ISSUE_MISSING_BINDING = "missing-driver-binding"
 ISSUE_NO_CANDIDATE = "no-loadable-module-candidate"
 ISSUE_KERNEL_MISMATCH = "kernel-version-mismatch"
 ISSUE_SIGNATURE_POLICY = "module-signature-policy-unknown"
-MODULE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_+-]+\Z")
+MODULE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_+][A-Za-z0-9_+-]*\Z")
 MODALIAS_PATTERN = re.compile(r"[A-Za-z0-9_:+.,-]+\Z")
 
 
