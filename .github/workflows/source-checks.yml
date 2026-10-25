@@ -28,8 +28,8 @@ jobs:
     container: fedora:44
     steps:
       - uses: actions/checkout@v4
-      - name: Install spec parser
-        run: dnf -y install rpm-build bash
+      - name: Install spec parser and source test runtime
+        run: dnf -y install rpm-build bash python3
       - name: Validate package specs and build script
         run: |
           set -euo pipefail

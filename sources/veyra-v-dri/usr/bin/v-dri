@@ -127,6 +127,8 @@ def collect_inventory(root: Path) -> dict[str, Any]:
 
     devices: list[dict[str, Any]] = []
     errors: list[str] = []
+    secure_boot = efi_secure_boot_state(sys_root)
+    enforcement = signature_enforcement(sys_root, proc_root)
     pci_devices = sys_root / "bus/pci/devices"
     try:
         paths = sorted(pci_devices.iterdir(), key=lambda path: path.name)
@@ -186,8 +188,6 @@ def collect_inventory(root: Path) -> dict[str, Any]:
             }
         )
 
-    secure_boot = efi_secure_boot_state(sys_root)
-    enforcement = signature_enforcement(sys_root, proc_root)
     if secure_boot is None and enforcement == "unknown":
         errors.append("Secure Boot and module-signature enforcement state could not be determined")
     return {

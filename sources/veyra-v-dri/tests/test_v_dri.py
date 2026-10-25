@@ -88,6 +88,21 @@ class VeyraDriverInventoryTests(unittest.TestCase):
         self.assertTrue(v_dri.efi_secure_boot_state(self.root / "sys"))
         self.assertEqual(v_dri.signature_enforcement(self.root / "sys", self.root / "proc"), "enforced")
 
+    def test_unsigned_candidate_is_flagged_when_signature_enforcement_is_active(self):
+        module_params = self.root / "sys/module/module/parameters"
+        module_params.mkdir(parents=True)
+        (module_params / "sig_enforce").write_text("Y\n")
+
+        def unsigned(args):
+            output, error = self.query(args)
+            if args[:2] == ["modinfo", "-F"] and args[2] == "signer":
+                return "", None
+            return output, error
+
+        with patch.object(v_dri, "command_output", side_effect=unsigned):
+            report = v_dri.collect_inventory(self.root)
+        self.assertIn(v_dri.ISSUE_SIGNATURE_POLICY, report["devices"][0]["issues"])
+
 
 if __name__ == "__main__":
     unittest.main()
