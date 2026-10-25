@@ -27,6 +27,7 @@ install -Dpm0755 usr/bin/vpkg %{buildroot}%{_bindir}/vpkg
 install -Dpm0644 usr/lib/veyra/vpkg_libdnf.py %{buildroot}%{_libdir}/veyra/vpkg_libdnf.py
 install -Dpm0644 usr/lib/veyra/veyra_repo.py %{buildroot}%{_libdir}/veyra/veyra_repo.py
 install -Dpm0644 usr/share/veyra/RPM-GPG-KEY-VEYRA %{buildroot}%{_datadir}/veyra/RPM-GPG-KEY-VEYRA
+install -Dpm0644 usr/share/veyra/vpkg/protected-core.json %{buildroot}%{_datadir}/veyra/vpkg/protected-core.json
 install -Dpm0644 etc/yum.repos.d/veyra-main.repo %{buildroot}%{_sysconfdir}/yum.repos.d/veyra-main.repo
 install -Dpm0644 etc/yum.repos.d/veyra-testing.repo %{buildroot}%{_sysconfdir}/yum.repos.d/veyra-testing.repo
 install -Dpm0644 usr/lib/systemd/system/veyra-vpkg-check.service %{buildroot}%{_unitdir}/veyra-vpkg-check.service
@@ -41,6 +42,7 @@ install -Dpm0644 usr/lib/systemd/system-preset/99-veyra-vpkg.preset %{buildroot}
 %{_libdir}/veyra/vpkg_libdnf.py
 %{_libdir}/veyra/veyra_repo.py
 %{_datadir}/veyra/RPM-GPG-KEY-VEYRA
+%{_datadir}/veyra/vpkg/protected-core.json
 %config %{_sysconfdir}/yum.repos.d/veyra-main.repo
 %config %{_sysconfdir}/yum.repos.d/veyra-testing.repo
 %{_unitdir}/veyra-vpkg-check.service
