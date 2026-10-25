@@ -1,6 +1,6 @@
 [veyra-testing]
 name=Veyra additional packages (testing)
-baseurl=https://raw.githubusercontent.com/angyedz/veyra-pkgrepo/main/repo/testing/$basearch/
+baseurl=file:///var/cache/veyra/vpkg/repositories/testing/current/$basearch/
 enabled=0
 gpgcheck=1
 repo_gpgcheck=1

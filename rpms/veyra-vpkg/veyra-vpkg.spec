@@ -7,6 +7,7 @@ BuildArch:      noarch
 Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  systemd-rpm-macros
 Requires:       libdnf5
+Requires:       gnupg2
 Requires:       python3
 Requires:       python3-libdnf5
 Requires:       rpm
@@ -24,6 +25,7 @@ keeps the DNF command-line client out of the Veyra host image.
 %install
 install -Dpm0755 usr/bin/vpkg %{buildroot}%{_bindir}/vpkg
 install -Dpm0644 usr/lib/veyra/vpkg_libdnf.py %{buildroot}%{_libdir}/veyra/vpkg_libdnf.py
+install -Dpm0644 usr/lib/veyra/veyra_repo.py %{buildroot}%{_libdir}/veyra/veyra_repo.py
 install -Dpm0644 usr/share/veyra/RPM-GPG-KEY-VEYRA %{buildroot}%{_datadir}/veyra/RPM-GPG-KEY-VEYRA
 install -Dpm0644 etc/yum.repos.d/veyra-main.repo %{buildroot}%{_sysconfdir}/yum.repos.d/veyra-main.repo
 install -Dpm0644 etc/yum.repos.d/veyra-testing.repo %{buildroot}%{_sysconfdir}/yum.repos.d/veyra-testing.repo
@@ -37,9 +39,10 @@ install -Dpm0644 usr/lib/systemd/system-preset/99-veyra-vpkg.preset %{buildroot}
 %files
 %{_bindir}/vpkg
 %{_libdir}/veyra/vpkg_libdnf.py
+%{_libdir}/veyra/veyra_repo.py
 %{_datadir}/veyra/RPM-GPG-KEY-VEYRA
-%config(noreplace) %{_sysconfdir}/yum.repos.d/veyra-main.repo
-%config(noreplace) %{_sysconfdir}/yum.repos.d/veyra-testing.repo
+%config %{_sysconfdir}/yum.repos.d/veyra-main.repo
+%config %{_sysconfdir}/yum.repos.d/veyra-testing.repo
 %{_unitdir}/veyra-vpkg-check.service
 %{_unitdir}/veyra-vpkg-sync.service
 %{_unitdir}/systemd-boot-check-no-failures.service.d/veyra-vpkg.conf

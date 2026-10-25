@@ -1,0 +1,589 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+SYSUPDATE=systemd-sysupdate
+SYSTEM_TRANSFER_DIRS=(
+    /usr/lib/sysupdate.d
+    /usr/local/lib/sysupdate.d
+    /run/sysupdate.d
+    /etc/sysupdate.d
+)
+VPKG_LAYER_DIR=/var/lib/veyra/vpkg/app-layers
+VPKG_PENDING_FILE=/var/lib/veyra/vpkg/pending.json
+
+valid_version() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]
+}
+
+copy_effective_transfer() {
+    local name="$1" destination="$2" directory
+    local found=false
+
+    for directory in "${SYSTEM_TRANSFER_DIRS[@]}"; do
+        if [[ -L "$directory/$name" && "$(readlink -f -- "$directory/$name" 2>/dev/null || true)" == /dev/null ]]; then
+            rm -f -- "$destination/$name"
+            found=true
+        elif [[ -f "$directory/$name" ]]; then
+            install -m 0644 -- "$directory/$name" "$destination/$name"
+            found=true
+        fi
+    done
+
+    [[ "$found" == true ]] || {
+        echo "Missing system update transfer definition: $name" >&2
+        return 1
+    }
+}
+
+parse_boot_identity() {
+    local token
+    local -a hashes=()
+    for token in $(</proc/cmdline); do
+        if [[ "$token" == roothash=* ]]; then
+            hashes+=("${token#roothash=}")
+        fi
+    done
+    [[ ${#hashes[@]} -eq 1 && "${hashes[0]}" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "The boot command line must contain exactly one valid dm-verity roothash." >&2
+        return 1
+    }
+    printf '%s\n' "${hashes[0]}"
+}
+
+uki_identity() {
+    python3 - "$1" <<'PY'
+import pathlib
+import re
+import struct
+import sys
+
+with pathlib.Path(sys.argv[1]).open("rb") as stream:
+    stream.seek(0x3C)
+    pe_offset = struct.unpack("<I", stream.read(4))[0]
+    stream.seek(pe_offset)
+    if stream.read(4) != b"PE\0\0":
+        raise SystemExit("not a PE/UKI image")
+    stream.seek(pe_offset + 6)
+    section_count = struct.unpack("<H", stream.read(2))[0]
+    stream.seek(pe_offset + 20)
+    optional_size = struct.unpack("<H", stream.read(2))[0]
+    table = pe_offset + 24 + optional_size
+    sections = {}
+    for index in range(section_count):
+        header = table + index * 40
+        stream.seek(header)
+        name = stream.read(8).split(b"\0", 1)[0]
+        stream.seek(header + 16)
+        raw_size, raw_offset = struct.unpack("<II", stream.read(8))
+        sections[name] = (raw_offset, raw_size)
+    if not {b".cmdline", b".osrel"}.issubset(sections):
+        raise SystemExit("UKI is missing its cmdline or os-release section")
+    values = {}
+    for name in (b".cmdline", b".osrel"):
+        offset, size = sections[name]
+        stream.seek(offset)
+        values[name] = stream.read(size).split(b"\0", 1)[0].decode("ascii")
+
+versions = re.findall(r"(?m)^IMAGE_VERSION=(.*)$", values[b".osrel"])
+version = versions[0].strip().strip('"') if len(versions) == 1 else ""
+hashes = [token.removeprefix("roothash=") for token in values[b".cmdline"].split()
+          if token.startswith("roothash=")]
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
+    raise SystemExit("UKI has an invalid or ambiguous IMAGE_VERSION")
+if len(hashes) != 1 or not re.fullmatch(r"[0-9a-f]{64}", hashes[0]):
+    raise SystemExit("UKI has a missing, duplicate, or invalid roothash")
+print(version)
+print(hashes[0])
+PY
+}
+
+uki_matches() {
+    local identity
+    identity="$(uki_identity "$1")" || return 1
+    [[ "${identity%%$'\n'*}" == "$2" && "${identity##*$'\n'}" == "$3" ]]
+}
+
+install_update() {
+    local version="$1" work root_definitions uki_definitions
+    local root_device verity_device root_uuid verity_uuid roothash=""
+    local candidate_root candidate_dir result_json result_status generation parsed_json trial_uki binding_created=false
+    local -a parsed=()
+
+    valid_version "$version" || {
+        echo "Invalid system update version: $version" >&2
+        return 2
+    }
+    if [[ -L "$VPKG_PENDING_FILE" || -e "$VPKG_PENDING_FILE" ]]; then
+        if [[ -L "$VPKG_PENDING_FILE" || ! -f "$VPKG_PENDING_FILE" ]]; then
+            echo "Pending OTA state is malformed; refusing to overwrite either deployment." >&2
+        else
+            echo "Another OTA transaction is pending; cancel it or finish its boot before staging another update." >&2
+        fi
+        return 1
+    fi
+    for trial_uki in "/boot/EFI/Linux/veyra-next_${version}.efi" "/boot/EFI/Linux/veyra-next_${version}+"*.efi; do
+        if [[ -e "$trial_uki" || -L "$trial_uki" ]]; then
+            echo "A UKI for Veyra $version already exists; refusing to replace another deployment identity." >&2
+            return 1
+        fi
+    done
+
+    work="$(mktemp -d /run/veyra-update.XXXXXX)"
+    candidate_root="$work/root"
+    root_definitions="$work/root-transfer"
+    uki_definitions="$work/uki-transfer"
+    mkdir -m 0700 "$candidate_root" "$root_definitions" "$uki_definitions"
+    cleanup_update_work() {
+        trap - RETURN
+        if mountpoint -q "$candidate_root"; then
+            umount "$candidate_root" || true
+        fi
+        if [[ "$binding_created" == false && -n "${candidate_dir:-}" && "$candidate_dir" == "$VPKG_LAYER_DIR"/ota-"$roothash".* && ! -L "$candidate_dir" ]]; then
+            rm -rf -- "$candidate_dir"
+        fi
+        rm -rf -- "$work"
+    }
+    trap cleanup_update_work RETURN
+
+    # systemd 259 has no download-only acquire verb. Stage only the immutable
+    # root and its verity tree first; without the UKI there is no boot trial.
+    copy_effective_transfer 10-root-verity.transfer "$root_definitions"
+    copy_effective_transfer 20-root.transfer "$root_definitions"
+    copy_effective_transfer 99-uki.transfer "$uki_definitions"
+    "$SYSUPDATE" --no-pager --definitions="$root_definitions" update "$version"
+
+    root_device="$(findfs "PARTLABEL=veyra-next_${version}")"
+    verity_device="$(findfs "PARTLABEL=veyra-next_${version}_verity")"
+    root_uuid="$(blkid --match-tag PARTUUID --output value "$root_device")"
+    verity_uuid="$(blkid --match-tag PARTUUID --output value "$verity_device")"
+    root_uuid="${root_uuid//-/}"
+    verity_uuid="${verity_uuid//-/}"
+    roothash="${root_uuid}${verity_uuid}"
+    [[ "$roothash" =~ ^[0-9a-fA-F]{64}$ ]] || {
+        echo "The staged root and verity partition UUIDs do not encode a valid dm-verity hash." >&2
+        return 1
+    }
+    roothash="${roothash,,}"
+
+    # Validate the signed root/verity pair before exposing the root RPM database
+    # to vpkg. The partitions are read-only outside this mount as well.
+    veritysetup verify --hash=sha256 "$root_device" "$verity_device" "$roothash"
+    mount --types erofs --options=ro,nodev,nosuid,noexec "$root_device" "$candidate_root"
+
+    install -d -m 0755 "$VPKG_LAYER_DIR"
+    candidate_dir="$(mktemp -d "$VPKG_LAYER_DIR/ota-${roothash}.XXXXXX")"
+    rmdir -- "$candidate_dir"
+    if ! result_json="$(vpkg prepare-for-base \
+        --base-root "$candidate_root" \
+        --roothash "$roothash" \
+        --output "$candidate_dir")"; then
+        printf '%s\n' "$result_json" >&2
+        echo "vpkg preflight did not approve the staged base; no trial UKI was installed." >&2
+        return 1
+    fi
+
+    if ! parsed_json="$(python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+if value.get("status") != "ready":
+    raise SystemExit("vpkg preflight did not return status=ready")
+generation = value.get("generation")
+if generation is not None and not isinstance(generation, str):
+    raise SystemExit("vpkg preflight returned an invalid generation path")
+print(value["status"])
+print(generation or "none")
+' <<<"$result_json")"; then
+        echo "vpkg preflight returned an invalid result; no trial UKI was installed." >&2
+        return 1
+    fi
+    mapfile -t parsed <<<"$parsed_json"
+    result_status="${parsed[0]:-}"
+    generation="${parsed[1]:-}"
+    [[ "$result_status" == ready ]] || {
+        echo "vpkg did not approve the staged base; no trial UKI was installed." >&2
+        return 1
+    }
+    if [[ "$generation" != none && "$generation" != "$candidate_dir" ]]; then
+        echo "vpkg returned a candidate generation outside the requested path." >&2
+        return 1
+    fi
+
+    # Binding the candidate and setting the shared mutation lock are one vpkg
+    # transaction. The UKI remains the final published update resource.
+    vpkg bind-generation \
+        --roothash "$roothash" \
+        --version "$version" \
+        --generation "$generation"
+    binding_created=true
+    if ! "$SYSUPDATE" --no-pager --definitions="$uki_definitions" update "$version"; then
+        remove_trial_uki "$version" "$roothash"
+        vpkg cancel-pending --roothash "$roothash" --version "$version" || true
+        echo "UKI installation failed; the pending vpkg binding was canceled." >&2
+        return 1
+    fi
+    trial_uki="/boot/EFI/Linux/veyra-next_${version}+3-0.efi"
+    if [[ ! -f "$trial_uki" || -L "$trial_uki" ]] || ! uki_matches "$trial_uki" "$version" "$roothash"; then
+        remove_trial_uki "$version" "$roothash"
+        vpkg cancel-pending --roothash "$roothash" --version "$version" || true
+        echo "The installed trial UKI does not match the preflighted root; pending activation was canceled." >&2
+        return 1
+    fi
+
+    printf 'Prepared Veyra %s for trial boot (dm-verity root %s).\n' "$version" "$roothash"
+    printf 'The old deployment and package generation remain selected until this UKI boots successfully.\n'
+}
+
+remove_trial_uki() {
+    local version="$1" expected_hash="$2" entry
+    local -a trial_entries=()
+    shopt -s nullglob
+    for entry in "/boot/EFI/Linux/veyra-next_${version}+"*.efi; do
+        case "${entry##*/}" in
+            "veyra-next_${version}+3-0.efi"|"veyra-next_${version}+2-1.efi"|"veyra-next_${version}+1-2.efi"|"veyra-next_${version}+0-3.efi") ;;
+            *) continue ;;
+        esac
+        [[ -f "$entry" && ! -L "$entry" ]] || continue
+        uki_matches "$entry" "$version" "$expected_hash" || continue
+        trial_entries+=("$entry")
+    done
+    if ((${#trial_entries[@]})); then
+        rm -f -- "${trial_entries[@]}"
+        sync -f /boot/EFI/Linux
+    fi
+}
+
+settle_fallback() {
+    local pending target_hash version current_stub current_version_hash exhausted stable entry
+    local -a parsed_pending=() trial_entries=()
+
+    [[ -f "$VPKG_PENDING_FILE" && ! -L "$VPKG_PENDING_FILE" ]] || return 0
+    if ! pending="$(python3 -c '
+import json, re, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value.get("schema") != 1:
+    raise SystemExit("unsupported pending OTA schema")
+root = value.get("target_roothash")
+version = value.get("version")
+if not isinstance(root, str) or not re.fullmatch(r"[0-9a-f]{64}", root):
+    raise SystemExit("invalid pending OTA roothash")
+if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
+    raise SystemExit("invalid pending OTA version")
+print(root)
+print(version)
+' "$VPKG_PENDING_FILE")"; then
+        echo "Cannot verify pending OTA identity; keeping package mutations blocked." >&2
+        return 0
+    fi
+    mapfile -t parsed_pending <<<"$pending"
+    target_hash="${parsed_pending[0]:-}"
+    version="${parsed_pending[1]:-}"
+    [[ -n "$target_hash" && -n "$version" ]] || return 0
+
+    current_stub="$(bootctl --print-stub-path 2>/dev/null)" || return 0
+    [[ -f "$current_stub" && ! -L "$current_stub" ]] || return 0
+    if ! current_version_hash="$(uki_identity "$current_stub")"; then
+        echo "Cannot inspect the running UKI; keeping package mutations blocked." >&2
+        return 0
+    fi
+    if [[ "${current_version_hash%%$'\n'*}" == "$version" && "${current_version_hash##*$'\n'}" == "$target_hash" ]]; then
+        return 0
+    fi
+
+    exhausted="/boot/EFI/Linux/veyra-next_${version}+0-3.efi"
+    stable="/boot/EFI/Linux/veyra-next_${version}.efi"
+    if [[ -e "$stable" || -L "$stable" ]]; then
+        # A stable UKI may have been blessed already; do not infer cancellation.
+        return 0
+    fi
+
+    shopt -s nullglob
+    for entry in "/boot/EFI/Linux/veyra-next_${version}+"*.efi; do
+        trial_entries+=("$entry")
+    done
+    if [[ -f "$exhausted" && ! -L "$exhausted" ]]; then
+        uki_matches "$exhausted" "$version" "$target_hash" || return 0
+        ((${#trial_entries[@]} == 1)) || return 0
+        # systemd-boot marks +0-3 bad but still allows manual selection. Remove
+        # only this exact exhausted target before releasing the mutation lock.
+        if ! rm -- "$exhausted" || ! sync -f /boot/EFI/Linux; then
+            echo "Could not durably retire the exhausted trial UKI; keeping package mutations blocked." >&2
+            return 0
+        fi
+    elif ((${#trial_entries[@]})); then
+        return 0
+    fi
+
+    if ! vpkg cancel-pending --roothash "$target_hash" --version "$version"; then
+        echo "Could not release the fallback package lock; it remains pending." >&2
+        return 0
+    fi
+    echo "Verified systemd-boot fallback; released the pending vpkg mutation lock."
+}
+
+cancel_update() {
+    local expected_version="${1:-}" pending current_stub current_identity
+    local target_hash version current_hash current_version
+    local -a parsed_pending=()
+
+    if ((EUID != 0)); then
+        echo "Cancel a staged system update with: sudo veyra-update cancel [VERSION]" >&2
+        return 1
+    fi
+    [[ -f "$VPKG_PENDING_FILE" && ! -L "$VPKG_PENDING_FILE" ]] || {
+        echo "There is no pending Veyra system update to cancel." >&2
+        return 1
+    }
+    pending="$(python3 -c '
+import json, re, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value.get("schema") != 1:
+    raise SystemExit("unsupported pending OTA schema")
+root = value.get("target_roothash")
+version = value.get("version")
+if not isinstance(root, str) or not re.fullmatch(r"[0-9a-f]{64}", root):
+    raise SystemExit("invalid pending OTA roothash")
+if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
+    raise SystemExit("invalid pending OTA version")
+print(root)
+print(version)
+' "$VPKG_PENDING_FILE")"
+    mapfile -t parsed_pending <<<"$pending"
+    target_hash="${parsed_pending[0]:-}"
+    version="${parsed_pending[1]:-}"
+    [[ -n "$target_hash" && -n "$version" ]] || {
+        echo "Could not read the pending Veyra update identity." >&2
+        return 1
+    }
+    if [[ -n "$expected_version" && "$expected_version" != "$version" ]]; then
+        echo "Pending update is $version, not $expected_version." >&2
+        return 1
+    fi
+    valid_version "$version" || {
+        echo "Invalid version in pending Veyra update state." >&2
+        return 1
+    }
+
+    current_stub="$(bootctl --print-stub-path)"
+    [[ -f "$current_stub" && ! -L "$current_stub" ]] || {
+        echo "Could not identify the running UKI; refusing to cancel the pending update." >&2
+        return 1
+    }
+    current_identity="$(uki_identity "$current_stub")" || return 1
+    current_version="${current_identity%%$'\n'*}"
+    current_hash="${current_identity##*$'\n'}"
+    if [[ "$current_hash" == "$target_hash" && "$current_version" == "$version" ]]; then
+        echo "The pending deployment is currently running; it cannot be canceled from this boot." >&2
+        return 1
+    fi
+
+    remove_trial_uki "$version" "$target_hash"
+    sync -f /boot/EFI/Linux
+    vpkg cancel-pending --roothash "$target_hash" --version "$version"
+    printf 'Canceled pending Veyra %s update.\n' "$version"
+}
+
+complete_pending_if_current() {
+    local pending target_hash version current_stub current_identity
+    local -a parsed_pending=()
+
+    [[ -f "$VPKG_PENDING_FILE" && ! -L "$VPKG_PENDING_FILE" ]] || return 0
+    if ! pending="$(python3 -c '
+import json, re, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+root = value.get("target_roothash")
+version = value.get("version")
+if value.get("schema") != 1 or not isinstance(root, str) or not re.fullmatch(r"[0-9a-f]{64}", root):
+    raise SystemExit("invalid pending OTA roothash")
+if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
+    raise SystemExit("invalid pending OTA version")
+print(root)
+print(version)
+' "$VPKG_PENDING_FILE")"; then
+        echo "Cannot verify pending OTA identity; preserving the mutation lock." >&2
+        return 0
+    fi
+    mapfile -t parsed_pending <<<"$pending"
+    target_hash="${parsed_pending[0]:-}"
+    version="${parsed_pending[1]:-}"
+    [[ -n "$target_hash" && -n "$version" ]] || return 0
+
+    if ! current_stub="$(bootctl --print-stub-path 2>/dev/null)" ||
+        [[ ! -f "$current_stub" || -L "$current_stub" ]] ||
+        ! current_identity="$(uki_identity "$current_stub")"; then
+        echo "Cannot inspect the running UKI; preserving the mutation lock." >&2
+        return 0
+    fi
+    if [[ "${current_identity%%$'\n'*}" != "$version" || "${current_identity##*$'\n'}" != "$target_hash" ]]; then
+        # systemd-boot can bless a manually selected old UKI. Keep OTA pending
+        # and allow that healthy fallback boot to complete normally.
+        return 0
+    fi
+    vpkg complete-pending --current
+}
+
+pending_update() {
+    local pending target_hash version entry
+    local -a parsed_pending=() trial_entries=()
+
+    [[ -f "$VPKG_PENDING_FILE" && ! -L "$VPKG_PENDING_FILE" ]] || {
+        echo "No Veyra system update is waiting for a reboot."
+        return 0
+    }
+    pending="$(python3 -c '
+import json, re, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+root = value.get("target_roothash")
+version = value.get("version")
+if value.get("schema") != 1 or not isinstance(root, str) or not re.fullmatch(r"[0-9a-f]{64}", root):
+    raise SystemExit("invalid pending OTA roothash")
+if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
+    raise SystemExit("invalid pending OTA version")
+print(root)
+print(version)
+' "$VPKG_PENDING_FILE")"
+    mapfile -t parsed_pending <<<"$pending"
+    target_hash="${parsed_pending[0]:-}"
+    version="${parsed_pending[1]:-}"
+    [[ -n "$target_hash" && -n "$version" ]] || return 1
+
+    shopt -s nullglob
+    for entry in \
+        "/boot/EFI/Linux/veyra-next_${version}+3-0.efi" \
+        "/boot/EFI/Linux/veyra-next_${version}+2-1.efi" \
+        "/boot/EFI/Linux/veyra-next_${version}+1-2.efi"; do
+        [[ -f "$entry" && ! -L "$entry" ]] || continue
+        if uki_matches "$entry" "$version" "$target_hash"; then
+            trial_entries+=("$entry")
+        fi
+    done
+    if ((${#trial_entries[@]})); then
+        printf 'Veyra %s is staged as a signed trial UKI and is waiting for reboot.\n' "$version"
+        return 0
+    fi
+    echo "The pending OTA marker has no matching bootable trial UKI; refusing to report a rebootable update." >&2
+    return 1
+}
+
+reboot_update() {
+    pending_update
+    [[ -f "$VPKG_PENDING_FILE" ]] || {
+        echo "There is no completed Veyra system update to reboot into." >&2
+        return 1
+    }
+    local version
+    version="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
+' "$VPKG_PENDING_FILE")"
+    bootctl set-oneshot "veyra-next_${version}.efi"
+    systemctl reboot
+}
+
+command_name="${1:-help}"
+if (($# > 0)); then
+    shift
+fi
+
+case "$command_name" in
+    list)
+        exec systemd-sysupdate --no-pager list "$@"
+        ;;
+    check)
+        exec systemd-sysupdate --no-pager check-new "$@"
+        ;;
+    install)
+        if ((EUID != 0)); then
+            echo "Install a system update with: sudo veyra-update install [VERSION]" >&2
+            exit 1
+        fi
+        if (($# > 1)); then
+            echo "Usage: sudo veyra-update install [VERSION]" >&2
+            exit 2
+        fi
+        if (($# == 0)); then
+            version="$(systemd-sysupdate --no-pager check-new)" || exit $?
+            if [[ -z "$version" ]]; then
+                echo "No system update is available."
+                exit 0
+            fi
+        else
+            version="$1"
+        fi
+        exec 9>/run/lock/veyra-update.lock
+        flock --exclusive 9
+        install_update "$version"
+        ;;
+    cancel)
+        if ((EUID != 0)); then
+            echo "Cancel a staged system update with: sudo veyra-update cancel [VERSION]" >&2
+            exit 1
+        fi
+        if (($# > 1)); then
+            echo "Usage: sudo veyra-update cancel [VERSION]" >&2
+            exit 2
+        fi
+        exec 9>/run/lock/veyra-update.lock
+        flock --exclusive 9
+        cancel_update "${1:-}"
+        ;;
+    settle)
+        if ((EUID != 0)); then
+            echo "System update state can be reconciled only by the boot service." >&2
+            exit 1
+        fi
+        exec 9>/run/lock/veyra-update.lock
+        flock --exclusive 9
+        settle_fallback
+        ;;
+    pending)
+        if (($#)); then
+            echo "Usage: veyra-update pending" >&2
+            exit 2
+        fi
+        exec 9</run/lock/veyra-update.lock
+        flock --shared 9
+        pending_update
+        ;;
+    reboot)
+        if ((EUID != 0)); then
+            echo "Reboot into the installed update with: sudo veyra-update reboot" >&2
+            exit 1
+        fi
+        if (($#)); then
+            echo "Usage: sudo veyra-update reboot" >&2
+            exit 2
+        fi
+        exec 9>/run/lock/veyra-update.lock
+        flock --exclusive 9
+        reboot_update
+        ;;
+    bless-complete)
+        if ((EUID != 0)); then
+            echo "The boot service must complete a blessed Veyra update." >&2
+            exit 1
+        fi
+        exec 9>/run/lock/veyra-update.lock
+        flock --exclusive 9
+        complete_pending_if_current
+        ;;
+    help|-h|--help)
+        cat <<'EOF'
+Usage: veyra-update <command> [VERSION]
+
+  list       Show installed and available system versions
+  check      Check whether a newer signed version is available
+  install    Stage and preflight a version before publishing its trial UKI
+  pending    Check whether a staged version awaits reboot
+  reboot     Reboot only when a staged system version is waiting
+  cancel     Remove a pending trial UKI and release the vpkg mutation lock
+
+Installing an update does not reboot automatically. Use the reboot command
+after saving your work. A trial boot is accepted only after boot checks pass.
+EOF
+        ;;
+    *)
+        echo "Unknown veyra-update command: $command_name" >&2
+        echo "Run 'veyra-update help' for usage." >&2
+        exit 2
+        ;;
+esac

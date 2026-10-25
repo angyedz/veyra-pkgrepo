@@ -1,0 +1,17 @@
+[Transfer]
+ProtectVersion=%A
+Verify=yes
+
+[Source]
+Type=url-file
+Path=https://github.com/angyedz/Veyra-next/releases/latest/download/
+MatchPattern=veyra-next_@v_@u.root-verity.raw.zst
+
+[Target]
+Type=partition
+Path=auto
+MatchPattern=veyra-next_@v_verity
+MatchPartitionType=root-verity
+PartitionUUID=@u
+PartitionFlags=0
+ReadOnly=1

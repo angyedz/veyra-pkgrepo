@@ -16,7 +16,7 @@ The repository contains only Veyra-maintained software. Source trees live in `so
 
 Versioned package releases are published as GitHub Releases from tags named `rpm-v<version>` (for example, `rpm-v0.1.0`). A testing prerelease uses the corresponding `rpm-v<version>-testing` tag. Each release contains signed RPM files, the Veyra public signing key, checksums, and a complete signed repository snapshot archive named `veyra-rpm-repo-x86_64.tar.gz`. `vpkg` consumes the signed release snapshot through libdnf5; the raw channel URLs below remain a development mirror.
 
-The repository includes a small `veyra-release` CI package and the `veyra-vpkg` source package. Vforge and OTA source packages are being added as their implementations stabilize. CI installs `veyra-vpkg` and checks that its runtime dependencies do not include the DNF command-line client. This repository will not carry the complete Fedora system package set.
+The repository includes the `veyra-vpkg` and `veyra-update` source packages plus a small `veyra-release` CI package. Vforge is being added as its implementation stabilizes. CI installs the runtime packages and checks that vpkg does not require the DNF command-line client. This repository will not carry the complete Fedora system package set.
 
 ## Configure a package channel
 

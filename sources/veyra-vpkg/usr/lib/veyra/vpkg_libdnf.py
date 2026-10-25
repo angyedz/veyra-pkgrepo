@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote, urlparse
 
 
 class LibdnfError(RuntimeError):
@@ -112,11 +113,15 @@ class Session:
         self.base.get_repo_sack().create_repos_from_system_configuration()
         query = self.libdnf5.repo.RepoQuery(self.base)
         self._repo_callbacks = []
+        veyra_repo_paths = self._resolve_veyra_repositories(query, cache_dir)
         for repo in query.list():
             repo_config = repo.get_config()
             _set_option(repo_config, "enabled", repo.get_id() in self.repo_ids)
             _set_option(repo_config, "pkg_gpgcheck", True)
             if repo.get_id() in {"veyra-main", "veyra-testing"}:
+                local_path = veyra_repo_paths.get(repo.get_id())
+                if local_path is not None:
+                    _set_option(repo_config, "baseurl", [local_path.as_uri().rstrip("/") + "/"])
                 trusted_key = "file:///usr/share/veyra/RPM-GPG-KEY-VEYRA"
                 class PinnedRepoKeyCallbacks(self.libdnf5.repo.RepoCallbacks):
                     def repokey_import(self, key_info) -> bool:
@@ -133,6 +138,53 @@ class Session:
         sack = self.base.get_repo_sack()
         sack.load_repos()
         self.refresh = refresh
+
+    def _resolve_veyra_repositories(self, query, cache_dir: Path) -> dict[str, Path]:
+        """Resolve release snapshots before libdnf5 loads Veyra metadata.
+
+        A repository explicitly configured as a local file repo (the isolated
+        RPM integration fixture) remains local. Production image definitions
+        point at an absent cache path; that is replaced with a verified release
+        snapshot before the repo sack is loaded.
+        """
+        selected = set(self.repo_ids) & {"veyra-main", "veyra-testing"}
+        if not selected:
+            return {}
+        configured = {repo.get_id(): repo for repo in query.list()}
+        result: dict[str, Path] = {}
+        for repo_id in selected:
+            repo = configured.get(repo_id)
+            if repo is None:
+                raise LibdnfError(f"Required Veyra repository configuration is missing: {repo_id}")
+            option = repo.get_config().get_baseurl_option()
+            configured_urls = option.get_value()
+            urls = [configured_urls] if isinstance(configured_urls, str) else list(configured_urls)
+            local_repo = None
+            for value in urls:
+                parsed = urlparse(value)
+                if parsed.scheme == "file":
+                    candidate = Path(unquote(parsed.path))
+                    is_release_cache = str(candidate).startswith(
+                        "/var/cache/veyra/vpkg/repositories/"
+                    )
+                    if not is_release_cache and (candidate / "repodata/repomd.xml").is_file():
+                        local_repo = candidate
+                        break
+            if local_repo is not None:
+                result[repo_id] = local_repo
+                continue
+            try:
+                from veyra_repo import VeyraRepoError, resolve_repository
+
+                channel = "main" if repo_id == "veyra-main" else "testing"
+                result[repo_id] = resolve_repository(
+                    channel,
+                    Path("/var/cache/veyra/vpkg/repositories"),
+                    Path("/usr/share/veyra/RPM-GPG-KEY-VEYRA"),
+                )
+            except (VeyraRepoError, OSError) as error:
+                raise LibdnfError(f"Could not prepare the signed {repo_id} release repository: {error}") from error
+        return result
 
     def resolve(
         self,
