@@ -60,7 +60,7 @@ for spec in "${specs[@]}"; do
       echo "Source directory must not be a symlink: $source_dir" >&2
       exit 1
     }
-    source_archive=$(rpmspec -q --qf '%{SOURCE0}\n' "$spec" | head -n 1)
+    source_archive=$(rpmspec --parse "$spec" | awk '$1 == "Source0:" { print $2; exit }')
     [[ "$source_archive" =~ ^[A-Za-z0-9._+-]+[.]tar[.]gz$ ]] || {
       echo "Source0 must be a simple .tar.gz filename when sources/$package_name exists: $source_archive" >&2
       exit 1

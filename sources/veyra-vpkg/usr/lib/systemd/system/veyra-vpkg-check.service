@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify that all installed Veyra system extensions are active
+Requires=systemd-sysext.service
+After=systemd-sysext.service
+Before=boot-complete.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/vpkg check-extensions

@@ -1,0 +1,2 @@
+enable veyra-vpkg-sync.service
+enable veyra-vpkg-check.service

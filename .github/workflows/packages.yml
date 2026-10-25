@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install RPM repository tools
-        run: dnf -y install rpm-build rpm-sign createrepo_c gnupg2 dnf git findutils coreutils
+        run: dnf -y install rpm-build rpm-sign systemd-rpm-macros createrepo_c gnupg2 dnf git findutils coreutils
 
       - name: Create disposable CI signing key
         env:
@@ -69,8 +69,14 @@ jobs:
           gpgkey=file://$repo_dir/RPM-GPG-KEY-VEYRA
           metadata_expire=0
           EOF
-          dnf -y --disablerepo='*' --enablerepo=veyra-ci install veyra-release
+          dnf -y --disablerepo='*' --enablerepo=veyra-ci install veyra-release veyra-vpkg
           test -s /usr/share/veyra/release
+          test -x /usr/bin/vpkg
+          test -s /usr/lib/veyra/vpkg_libdnf.py
+          if rpm -q --requires veyra-vpkg | grep -Eq '^dnf5(-plugins)?([ <=>].*)?$'; then
+            echo 'veyra-vpkg must not require the DNF5 command-line packages.' >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
