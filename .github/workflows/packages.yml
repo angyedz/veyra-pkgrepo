@@ -79,7 +79,7 @@ jobs:
           test -s /usr/share/veyra/vpkg/protected-core.json
           rpm -ql veyra-vpkg | grep -Fx /usr/share/veyra/vpkg/protected-core.json
           rpm -qf /usr/share/veyra/vpkg/protected-core.json | grep -Eq '^veyra-vpkg-[0-9]'
-          python3 -c 'import json; p=json.load(open("/usr/share/veyra/vpkg/protected-core.json", encoding="utf-8")); assert p["schema"] == 1 and p["supported_base"] == {"id": "fedora", "version_id": "44"}; assert "glibc" in p["protected_packages"]["names"]'
+          python3 -c 'import json; p=json.load(open("/usr/share/veyra/vpkg/protected-core.json", encoding="utf-8")); assert p["schema"] == 1 and p["supported_base"] == {"id": "fedora", "version_id": "44"}; assert {"glibc", "libdnf5", "python3-libdnf5"}.issubset(p["protected_packages"]["names"]); assert {"/usr/lib/modules/", "/usr/share/veyra/"}.issubset(p["payload_paths"]["denied_prefixes"])'
           test -x /usr/bin/veyra-update
           test -s /usr/lib/sysupdate.d/99-uki.transfer
           if rpm -q --requires veyra-vpkg | grep -Eq '^dnf5(-plugins)?([ <=>].*)?$'; then
