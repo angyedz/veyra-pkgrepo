@@ -10,7 +10,7 @@ on:
       - '.github/workflows/**'
       - 'README.md'
   pull_request:
-    branches: [main]
+    branches: [main, feature/first-party-rpms]
     paths:
       - 'rpms/**'
       - 'sources/**'
@@ -71,12 +71,16 @@ jobs:
           EOF
           # Keep Fedora 44 enabled for runtime dependencies; the three Veyra RPMs
           # are still resolved from the signed local snapshot repository.
-          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update
+          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update veyra-v-dri
           test -s /usr/share/veyra/release
           test -x /usr/bin/vpkg
           test -s /usr/lib/veyra/vpkg_libdnf.py
           test -s /usr/lib/veyra/veyra_repo.py
           test -x /usr/bin/veyra-update
+          test -x /usr/bin/v-dri
+          /usr/bin/v-dri --help >/dev/null
+          /usr/bin/v-dri status --json > "$RUNNER_TEMP/v-dri-status.json"
+          python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["schema_version"] == 1' "$RUNNER_TEMP/v-dri-status.json"
           test -s /usr/lib/sysupdate.d/99-uki.transfer
           if rpm -q --requires veyra-vpkg | grep -Eq '^dnf5(-plugins)?([ <=>].*)?$'; then
             echo 'veyra-vpkg must not require the DNF5 command-line packages.' >&2

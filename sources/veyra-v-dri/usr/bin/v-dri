@@ -1,0 +1,308 @@
+#!/usr/bin/python3
+"""Read-only Veyra PCI hardware and driver inventory tool."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+DEVICE_CLASSES = {
+    "0x01": "storage",
+    "0x02": "network",
+    "0x03": "display",
+    "0x04": "multimedia",
+    "0x05": "memory",
+    "0x06": "bridge",
+    "0x07": "communication",
+    "0x08": "system-peripheral",
+    "0x09": "input",
+    "0x0a": "docking",
+    "0x0b": "processor",
+    "0x0c": "serial-bus",
+    "0x0d": "wireless",
+    "0x0e": "intelligent-controller",
+    "0x0f": "satellite",
+    "0x10": "encryption",
+    "0x11": "signal-processing",
+}
+DRIVER_DIAGNOSTIC_CLASSES = {
+    "display", "network", "multimedia", "storage", "communication",
+    "system-peripheral", "input", "serial-bus", "wireless", "signal-processing",
+}
+ISSUE_MISSING_BINDING = "missing-driver-binding"
+ISSUE_NO_CANDIDATE = "no-loadable-module-candidate"
+ISSUE_KERNEL_MISMATCH = "kernel-version-mismatch"
+ISSUE_SIGNATURE_POLICY = "module-signature-policy-unknown"
+MODULE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_+][A-Za-z0-9_+-]*\Z")
+MODALIAS_PATTERN = re.compile(r"[A-Za-z0-9_:+.,-]+\Z")
+DRIVER_LOG_MARKERS = (
+    "firmware: failed to load",
+    "failed to load firmware",
+    "module verification failed",
+    "signature and/or required key missing",
+    "failed to insert module",
+    "unknown symbol",
+    "drm: failed",
+    "amdgpu: failed",
+    "i915: failed",
+    "nouveau: failed",
+)
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def command_output(args: list[str]) -> tuple[str | None, str | None]:
+    try:
+        result = subprocess.run(args, check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if result.returncode != 0:
+        return None, result.stderr.strip() or f"exit status {result.returncode}"
+    return result.stdout.strip(), None
+
+
+def resolve_candidates(modalias: str) -> tuple[list[str], str | None]:
+    if not MODALIAS_PATTERN.fullmatch(modalias):
+        return [], "device modalias contains invalid characters"
+    output, error = command_output(["modprobe", "--resolve-alias", modalias])
+    if output is None:
+        return [], error
+    candidates: set[str] = set()
+    invalid = False
+    for line in output.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if MODULE_NAME_PATTERN.fullmatch(candidate):
+            candidates.add(candidate)
+        else:
+            invalid = True
+    error = "module alias resolver returned an invalid module name" if invalid else None
+    return sorted(candidates), error
+
+
+def module_details(name: str, running_kernel: str) -> dict[str, Any]:
+    details: dict[str, Any] = {"name": name, "available": False}
+    for field in ("filename", "vermagic", "signer"):
+        value, error = command_output(["modinfo", "-F", field, name])
+        if error:
+            details.setdefault("errors", []).append(error)
+            continue
+        details[field] = value or None
+    filename = details.get("filename")
+    vermagic = details.get("vermagic")
+    details["available"] = filename is not None
+    if filename == "(builtin)":
+        details["kernel_compatible"] = True
+        details["builtin"] = True
+    else:
+        details["builtin"] = False
+        module_kernel = vermagic.split(maxsplit=1)[0] if vermagic else None
+        details["kernel_release"] = module_kernel
+        details["kernel_compatible"] = module_kernel == running_kernel if module_kernel else None
+    return details
+
+
+def efi_secure_boot_state(sys_root: Path) -> bool | None:
+    variables = sys_root / "firmware/efi/efivars"
+    try:
+        candidates = sorted(variables.glob("SecureBoot-*"))
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        # EFI variable files start with four attribute bytes, followed by data.
+        if len(raw) >= 5:
+            return raw[4] == 1
+    return None
+
+
+def signature_enforcement(sys_root: Path, proc_root: Path) -> str:
+    param = read_text(sys_root / "module/module/parameters/sig_enforce")
+    if param in {"Y", "1"}:
+        return "enforced"
+    if param in {"N", "0"}:
+        return "not-enforced"
+    command_line = read_text(proc_root / "cmdline") or ""
+    if re.search(r"(?:^|\s)module\.sig_enforce=1(?:\s|$)", command_line):
+        return "enforced"
+    return "unknown"
+
+
+def collect_kernel_diagnostics() -> dict[str, Any]:
+    output, error = command_output(
+        ["journalctl", "--dmesg", "--boot", "--lines=2000", "--no-pager", "--output=cat"]
+    )
+    if output is None:
+        return {"available": False, "findings": [], "error": error}
+    findings: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        normalized = line.casefold()
+        if not any(marker in normalized for marker in DRIVER_LOG_MARKERS):
+            continue
+        clean = "".join(char for char in line if char.isprintable()).strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            findings.append(clean[:500])
+        if len(findings) >= 40:
+            break
+    return {"available": True, "findings": findings, "error": None}
+
+
+def collect_inventory(root: Path, include_kernel_logs: bool = False) -> dict[str, Any]:
+    sys_root = root / "sys"
+    proc_root = root / "proc"
+    running_kernel = read_text(proc_root / "sys/kernel/osrelease")
+    if not running_kernel:
+        running_kernel = os.uname().release if root == Path("/") else "unknown"
+
+    devices: list[dict[str, Any]] = []
+    errors: list[str] = []
+    secure_boot = efi_secure_boot_state(sys_root)
+    enforcement = signature_enforcement(sys_root, proc_root)
+    pci_devices = sys_root / "bus/pci/devices"
+    try:
+        paths = sorted(pci_devices.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        paths = []
+        errors.append(f"Cannot read PCI inventory at {pci_devices}: {exc}")
+
+    for path in paths:
+        device_class = read_text(path / "class")
+        class_prefix = device_class[:4] if device_class else None
+        kind = DEVICE_CLASSES.get(class_prefix or "", "other")
+        modalias = read_text(path / "modalias")
+        driver_link = path / "driver"
+        try:
+            driver = driver_link.resolve(strict=True).name
+        except OSError:
+            driver = None
+        module_link = path / "driver/module"
+        try:
+            module = module_link.resolve(strict=True).name
+        except OSError:
+            module = driver
+
+        candidates: list[str] = []
+        candidate_error = None
+        if modalias:
+            candidates, candidate_error = resolve_candidates(modalias)
+        module_reports = [module_details(name, running_kernel) for name in candidates]
+        issues: list[str] = []
+        if not driver and kind in DRIVER_DIAGNOSTIC_CLASSES:
+            issues.append(ISSUE_MISSING_BINDING)
+        if modalias and not candidates and kind in DRIVER_DIAGNOSTIC_CLASSES:
+            issues.append(ISSUE_NO_CANDIDATE)
+        if any(item.get("kernel_compatible") is False for item in module_reports):
+            issues.append(ISSUE_KERNEL_MISMATCH)
+        if enforcement == "enforced" and module_reports and not any(
+            item.get("signer") and item.get("kernel_compatible") is not False
+            for item in module_reports
+        ):
+            issues.append(ISSUE_SIGNATURE_POLICY)
+        if candidate_error:
+            errors.append(f"{path.name}: cannot resolve module alias: {candidate_error}")
+        devices.append(
+            {
+                "address": path.name,
+                "class": kind,
+                "pci_class": device_class,
+                "vendor": read_text(path / "vendor"),
+                "device": read_text(path / "device"),
+                "subsystem_vendor": read_text(path / "subsystem_vendor"),
+                "subsystem_device": read_text(path / "subsystem_device"),
+                "driver": driver,
+                "module": module,
+                "modalias": modalias,
+                "candidates": module_reports,
+                "issues": issues,
+            }
+        )
+
+    if secure_boot is None and enforcement == "unknown":
+        errors.append("Secure Boot and module-signature enforcement state could not be determined")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kernel_release": running_kernel,
+        "secure_boot": secure_boot,
+        "module_signature_enforcement": enforcement,
+        "devices": devices,
+        "errors": errors,
+        "kernel_diagnostics": collect_kernel_diagnostics() if include_kernel_logs else None,
+    }
+
+
+def render_text(report: dict[str, Any]) -> str:
+    lines = [f"Kernel: {report['kernel_release']}"]
+    secure_boot = report["secure_boot"]
+    lines.append(f"Secure Boot: {'enabled' if secure_boot else 'disabled' if secure_boot is False else 'unknown'}")
+    lines.append(f"Module signature enforcement: {report['module_signature_enforcement']}")
+    diagnostics = report.get("kernel_diagnostics")
+    if diagnostics is not None:
+        if not diagnostics["available"]:
+            lines.append("Kernel log: unavailable")
+        elif diagnostics["findings"]:
+            for finding in diagnostics["findings"]:
+                lines.append(f"Kernel finding: {finding}")
+        else:
+            lines.append("Kernel log: no matching driver errors found")
+    if not report["devices"]:
+        lines.append("No PCI devices found.")
+    for device in report["devices"]:
+        ids = f"{device['vendor'] or '????'}:{device['device'] or '????'}"
+        lines.append(f"{device['class'].title()} {device['address']} ({ids})")
+        lines.append(f"  Bound driver: {device['driver'] or 'none'}")
+        if device["candidates"]:
+            candidates = ", ".join(item["name"] for item in device["candidates"])
+            lines.append(f"  Alias candidates: {candidates}")
+        for issue in device["issues"]:
+            lines.append(f"  Finding: {issue}")
+    for error in report["errors"]:
+        lines.append(f"Warning: {error}")
+    lines.append("This command is read-only; it does not install or load drivers.")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="v-dri",
+        description="Read-only PCI hardware and kernel-driver diagnostics for Veyra.",
+    )
+    parser.add_argument("command", choices=("status", "doctor"), nargs="?", default="status")
+    parser.add_argument("--json", action="store_true", help="print versioned JSON")
+    parser.add_argument("--root", type=Path, default=Path("/"), help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    report = collect_inventory(args.root, include_kernel_logs=args.command == "doctor")
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(render_text(report))
+    has_device_issue = any(device["issues"] for device in report["devices"])
+    log_findings = bool(
+        report.get("kernel_diagnostics")
+        and report["kernel_diagnostics"].get("findings")
+    )
+    if args.command == "doctor" and (has_device_issue or report["errors"] or log_findings):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
