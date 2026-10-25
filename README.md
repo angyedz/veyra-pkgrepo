@@ -14,7 +14,7 @@ These package channels are directories, not Git branches:
 
 The repository contains only Veyra-maintained software. Source trees live in `sources/<package>/`; RPM recipes live in `rpms/<package>/`. GitHub Actions builds these sources into signed RPMs and publishes the testing and stable DNF repository snapshots. Fedora remains the separate source for Fedora packages and dependencies; this repository does not mirror Fedora.
 
-Versioned package releases are published as GitHub Releases from tags named `rpm-v<version>` (for example, `rpm-v0.1.0`). Each release contains signed RPM files, the Veyra public signing key, checksums, and a complete signed repository snapshot archive. The normal DNF repository remains available at the channel URLs below, and `vpkg` uses libdnf5 to resolve packages across the configured Fedora and Veyra repositories.
+Versioned package releases are published as GitHub Releases from tags named `rpm-v<version>` (for example, `rpm-v0.1.0`). A testing prerelease uses the corresponding `rpm-v<version>-testing` tag. Each release contains signed RPM files, the Veyra public signing key, checksums, and a complete signed repository snapshot archive named `veyra-rpm-repo-x86_64.tar.gz`. `vpkg` consumes the signed release snapshot through libdnf5; the raw channel URLs below remain a development mirror.
 
 The repository includes a small `veyra-release` CI package and the `veyra-vpkg` source package. Vforge and OTA source packages are being added as their implementations stabilize. CI installs `veyra-vpkg` and checks that its runtime dependencies do not include the DNF command-line client. This repository will not carry the complete Fedora system package set.
 
@@ -43,7 +43,7 @@ export VEYRA_RPM_GPG_FINGERPRINT=YOUR_SIGNING_KEY_FINGERPRINT
 bash scripts/build-rpm-repo.sh /tmp/veyra-repo/x86_64
 ```
 
-Pull request checks use disposable keys and validate the RPM plus signed repository metadata without publishing. A push to GitHub's `main` code branch builds and publishes the signed `testing` package channel. After validating that snapshot, dispatch **Publish Veyra RPM repository** from Git branch `main` with package channel `main` to promote the exact RPM files into the stable package channel. To publish downloadable versioned RPM assets, tag a reviewed commit as `rpm-v<version>`; the release workflow builds in Fedora 44, verifies the tag is on `main`, signs the packages, and creates a GitHub Release.
+Pull request checks use disposable keys and validate the RPM plus signed repository metadata without publishing. A push to GitHub's `main` code branch builds and publishes the signed `testing` package mirror. After validating that snapshot, dispatch **Publish Veyra RPM repository** from Git branch `main` with package channel `main` to promote the exact RPM files into the stable mirror. To publish downloadable versioned RPM assets, tag a reviewed commit as `rpm-v<version>` or `rpm-v<version>-testing`; the release workflow builds in Fedora 44, verifies the tag is on `main`, signs the packages, and creates a stable release or testing prerelease.
 
 Publishing expects an armored OpenPGP private key, base64-encoded as the GitHub Actions secret `VEYRA_RPM_GPG_PRIVATE_KEY_B64`. The workflow's built-in `GITHUB_TOKEN` only commits generated repository snapshots; it is not a package-signing key. The legacy `VEYRA_ABUILD_PRIVATE_KEY_B64` signs APKs and is not an RPM/OpenPGP key. A GitHub Personal Access Token also cannot sign RPM package payloads. Never place private signing material in the repository.
 

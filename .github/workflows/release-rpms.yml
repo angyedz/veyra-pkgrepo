@@ -25,6 +25,9 @@ jobs:
         run: |
           set -euo pipefail
           tag_version="${GITHUB_REF_NAME#rpm-v}"
+          if [[ "$tag_version" == *-testing ]]; then
+            tag_version="${tag_version%-testing}"
+          fi
           [[ "$tag_version" =~ ^[0-9]+([.][0-9A-Za-z_-]+)*$ ]]
           git fetch origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
@@ -128,9 +131,9 @@ jobs:
           (cd "$repo_dir" && sha256sum ./*.rpm RPM-GPG-KEY-VEYRA > SHA256SUMS)
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
             -C "$RUNNER_TEMP/veyra-rpm-repo" \
-            -czf "$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz" x86_64
-          repo_archive="$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz"
-          sha256sum "$repo_archive" > "$repo_archive.sha256"
+            -czf "$RUNNER_TEMP/veyra-rpm-repo-x86_64.tar.gz" x86_64
+          repo_archive="$RUNNER_TEMP/veyra-rpm-repo-x86_64.tar.gz"
+          (cd "$RUNNER_TEMP" && sha256sum "$(basename "$repo_archive")" > "$(basename "$repo_archive").sha256")
 
       - name: Create GitHub Release with signed RPMs
         env:
@@ -138,11 +141,22 @@ jobs:
         run: |
           set -euo pipefail
           repo_dir="$RUNNER_TEMP/veyra-rpm-repo/x86_64"
+          tag_version="${GITHUB_REF_NAME#rpm-v}"
+          channel=main
+          if [[ "$tag_version" == *-testing ]]; then
+            tag_version="${tag_version%-testing}"
+            channel=testing
+          fi
+          release_args=()
+          if [[ "$channel" == testing ]]; then
+            release_args+=(--prerelease)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             "$repo_dir"/*.rpm \
             "$repo_dir/RPM-GPG-KEY-VEYRA" \
             "$repo_dir/SHA256SUMS" \
-            "$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz" \
-            "$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz.sha256" \
-            --title "Veyra RPM packages ${GITHUB_REF_NAME#rpm-v}" \
-            --notes "Signed Veyra RPM packages built from ${GITHUB_SHA} in Fedora 44. Fedora packages remain in the official Fedora repositories."
+            "$RUNNER_TEMP/veyra-rpm-repo-x86_64.tar.gz" \
+            "$RUNNER_TEMP/veyra-rpm-repo-x86_64.tar.gz.sha256" \
+            --title "Veyra RPM packages ${tag_version} (${channel})" \
+            --notes "Signed Veyra RPM packages built from ${GITHUB_SHA} in Fedora 44. Fedora packages remain in the official Fedora repositories." \
+            "${release_args[@]}"
