@@ -7,7 +7,7 @@ if [[ "$output_dir" != /* ]]; then
   output_dir="$repo_root/$output_dir"
 fi
 
-for tool in rpmbuild rpmspec rpmsign rpm createrepo_c gpg; do
+for tool in rpmbuild rpmspec rpmsign rpm createrepo_c gpg tar; do
   command -v "$tool" >/dev/null || {
     echo "Required build tool not found: $tool" >&2
     exit 1
@@ -43,7 +43,7 @@ rpm_count=0
 for spec in "${specs[@]}"; do
   package_dir=$(dirname "$spec")
   package_name=$(rpmspec -q --qf '%{NAME}\n' "$spec" | head -n 1)
-  [[ -n "$package_name" ]] || {
+  [[ "$package_name" =~ ^[A-Za-z0-9._+-]+$ ]] || {
     echo "Could not read package name from $spec" >&2
     exit 1
   }
@@ -52,6 +52,23 @@ for spec in "${specs[@]}"; do
   cp "$spec" "$topdir/SPECS/"
   if [[ -d "$package_dir/SOURCES" ]]; then
     cp -a "$package_dir/SOURCES/." "$topdir/SOURCES/"
+  fi
+
+  source_dir="$repo_root/sources/$package_name"
+  if [[ -d "$source_dir" ]]; then
+    [[ ! -L "$source_dir" ]] || {
+      echo "Source directory must not be a symlink: $source_dir" >&2
+      exit 1
+    }
+    source_archive=$(rpmspec -q --qf '%{SOURCE0}\n' "$spec" | head -n 1)
+    [[ "$source_archive" =~ ^[A-Za-z0-9._+-]+[.]tar[.]gz$ ]] || {
+      echo "Source0 must be a simple .tar.gz filename when sources/$package_name exists: $source_archive" >&2
+      exit 1
+    }
+    source_root=${source_archive%.tar.gz}
+    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
+      --transform="s,^[^/]*,$source_root," \
+      -C "$repo_root/sources" -czf "$topdir/SOURCES/$source_archive" "$package_name"
   fi
 
   rpmbuild -bb \
