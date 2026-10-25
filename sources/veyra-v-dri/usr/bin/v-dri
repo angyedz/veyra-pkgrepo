@@ -41,6 +41,8 @@ ISSUE_MISSING_BINDING = "missing-driver-binding"
 ISSUE_NO_CANDIDATE = "no-loadable-module-candidate"
 ISSUE_KERNEL_MISMATCH = "kernel-version-mismatch"
 ISSUE_SIGNATURE_POLICY = "module-signature-policy-unknown"
+MODULE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_+-]+\Z")
+MODALIAS_PATTERN = re.compile(r"[A-Za-z0-9_:+.,-]+\Z")
 
 
 def read_text(path: Path) -> str | None:
@@ -61,10 +63,23 @@ def command_output(args: list[str]) -> tuple[str | None, str | None]:
 
 
 def resolve_candidates(modalias: str) -> tuple[list[str], str | None]:
+    if not MODALIAS_PATTERN.fullmatch(modalias):
+        return [], "device modalias contains invalid characters"
     output, error = command_output(["modprobe", "--resolve-alias", modalias])
     if output is None:
         return [], error
-    return sorted({line.strip() for line in output.splitlines() if line.strip()}), None
+    candidates: set[str] = set()
+    invalid = False
+    for line in output.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if MODULE_NAME_PATTERN.fullmatch(candidate):
+            candidates.add(candidate)
+        else:
+            invalid = True
+    error = "module alias resolver returned an invalid module name" if invalid else None
+    return sorted(candidates), error
 
 
 def module_details(name: str, running_kernel: str) -> dict[str, Any]:

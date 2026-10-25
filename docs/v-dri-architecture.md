@@ -36,18 +36,16 @@ bundle. Text output is intended for a person troubleshooting a device.
 ## Trust and activation boundary
 
 `v-dri` must not replace the official kernel; kernel changes go through OTA.
-External modules must be built for and tied to the exact kernel release and
-deployment identity, carry an accepted signature, and have their artifact
-digest verified before staging. The tool must not enroll keys, relax module
-signature enforcement, disable Secure Boot, or make unsigned modules loadable.
+Driver packages come from Fedora's official repositories. The first-party Veyra
+RPM repository contains Veyra software such as `v-dri`, `vpkg`, `vforge`, and
+`veyra-update`; it does not carry kernel or driver modules. No RPM Fusion or
+other third-party driver repositories are enabled by this component.
 
-The current Veyra UKIs are unsigned and there is no approved Veyra module-key
-enrollment or signed driver-artifact pipeline. Therefore this package does not
-offer driver installation or activation. Before that capability is added, the
-project must approve the signing-key ownership, enrollment and recovery model,
-whether upstream/Fedora-signed modules are accepted, artifact provenance,
-OTA binding, and rollback behavior. This is an explicit architectural gate,
-not an automatic consent prompt.
+The current Veyra UKIs are unsigned. `v-dri` therefore does not install,
+activate, or load external modules and does not enroll keys, relax module
+signature enforcement, disable Secure Boot, or make unsigned modules loadable.
+Any future support for out-of-tree modules requires a separately approved
+signing, provenance, OTA-binding, and rollback design.
 
 ## Commands
 
@@ -72,10 +70,13 @@ this implementation.
 
 ## Follow-up tasks
 
-- [ ] Define and approve the module-signing and key-enrollment model.
-- [ ] Define signed, versioned driver artifact metadata bound to kernel NEVRA,
-  kernel release, deployment root hash, and image version.
-- [ ] Add repository/catalog resolution without adding host DNF CLI.
-- [ ] Integrate candidate activation with OTA and safe rollback.
-- [ ] Exercise compatible and incompatible modules, signature rejection,
-  kernel upgrade, OTA fallback, and diagnostics inside QEMU.
+- [ ] Resolve only Fedora-official driver/provider packages, using libdnf5 or
+  vpkg APIs and never adding host DNF CLI.
+- [ ] Define supported Fedora package flows for graphics, network and other
+  driver updates; all kernel/module changes remain OTA-owned.
+- [ ] Integrate supported driver updates with OTA candidate preparation and
+  safe rollback.
+- [ ] Exercise compatible and incompatible packages, module signature
+  enforcement, kernel upgrades, OTA fallback, and diagnostics in QEMU.
+- [ ] Treat out-of-tree driver modules as out of scope unless the project later
+  approves a separate signed-artifact and key-enrollment design.

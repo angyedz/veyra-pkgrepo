@@ -78,6 +78,24 @@ class VeyraDriverInventoryTests(unittest.TestCase):
             report = v_dri.collect_inventory(self.root)
         self.assertIn(v_dri.ISSUE_KERNEL_MISMATCH, report["devices"][0]["issues"])
 
+    def test_malformed_modalias_is_not_passed_to_modprobe(self):
+        (self.device / "modalias").write_text("-exec=unexpected\n")
+        with patch.object(v_dri, "command_output", side_effect=AssertionError("must not execute")):
+            report = v_dri.collect_inventory(self.root)
+        self.assertEqual(report["devices"][0]["candidates"], [])
+        self.assertTrue(any("invalid characters" in error for error in report["errors"]))
+
+    def test_invalid_module_name_from_resolver_is_not_passed_to_modinfo(self):
+        def resolver(args):
+            self.assertEqual(args[:2], ["modprobe", "--resolve-alias"])
+            return "-o\nsafe_module\n", None
+
+        with patch.object(v_dri, "command_output", side_effect=resolver) as run:
+            candidates, error = v_dri.resolve_candidates("pci:v00008086")
+        self.assertEqual(candidates, ["safe_module"])
+        self.assertIn("invalid module name", error)
+        self.assertEqual(run.call_count, 1)
+
     def test_secure_boot_variable_and_signature_enforcement_are_read_only(self):
         efi = self.root / "sys/firmware/efi/efivars"
         efi.mkdir(parents=True)
