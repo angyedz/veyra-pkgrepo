@@ -69,9 +69,9 @@ jobs:
           gpgkey=file://$repo_dir/RPM-GPG-KEY-VEYRA
           metadata_expire=0
           EOF
-          # Keep Fedora 44 enabled for runtime dependencies; the three Veyra RPMs
+          # Keep Fedora 44 enabled for runtime dependencies; the Veyra RPMs
           # are still resolved from the signed local snapshot repository.
-          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update
+          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update veyra-vforge
           test -s /usr/share/veyra/release
           test -x /usr/bin/vpkg
           test -s /usr/lib/veyra/vpkg_libdnf.py
@@ -82,6 +82,12 @@ jobs:
           python3 -c 'import json; p=json.load(open("/usr/share/veyra/vpkg/protected-core.json", encoding="utf-8")); assert p["schema"] == 1 and p["supported_base"] == {"id": "fedora", "version_id": "44"}; assert {"glibc", "libdnf5", "python3-libdnf5"}.issubset(p["protected_packages"]["names"]); assert {"/usr/lib/modules/", "/usr/share/veyra/"}.issubset(p["payload_paths"]["denied_prefixes"])'
           test -x /usr/bin/veyra-update
           test -s /usr/lib/sysupdate.d/99-uki.transfer
+          test -x /usr/bin/vforge
+          vforge --help > /tmp/veyra-vforge-help.txt
+          grep -Fq 'persistent Fedora 44 environment' /tmp/veyra-vforge-help.txt
+          for requirement in e2fsprogs fuse-overlayfs podman python3; do
+            rpm -q --requires veyra-vforge | grep -Fx "$requirement"
+          done
           if rpm -q --requires veyra-vpkg | grep -Eq '^dnf5(-plugins)?([ <=>].*)?$'; then
             echo 'veyra-vpkg must not require the DNF5 command-line packages.' >&2
             exit 1
