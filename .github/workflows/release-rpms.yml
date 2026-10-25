@@ -1,0 +1,148 @@
+name: Release Veyra RPM packages
+
+on:
+  push:
+    tags:
+      - 'rpm-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install RPM build tools
+        run: dnf -y install rpm-build rpm-sign createrepo_c gnupg2 dnf git findutils coreutils tar
+
+      - name: Verify release tag and package versions
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#rpm-v}"
+          [[ "$tag_version" =~ ^[0-9]+([.][0-9A-Za-z_-]+)*$ ]]
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          shopt -s nullglob
+          specs=(rpms/*/*.spec)
+          test "${#specs[@]}" -gt 0
+          for spec in "${specs[@]}"; do
+            version=$(rpmspec -q --qf '%{VERSION}\n' "$spec" | head -n 1)
+            test "$version" = "$tag_version" || {
+              echo "$spec version $version does not match tag $GITHUB_REF_NAME" >&2
+              exit 1
+            }
+          done
+
+      - name: Create disposable signing key for isolated build
+        env:
+          GNUPGHOME: ${{ runner.temp }}/veyra-ci-gnupg
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$GNUPGHOME"
+          gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+            --quick-generate-key "Veyra CI ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" rsa3072 sign 1d
+          fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+          test -n "$fingerprint"
+          echo "VEYRA_RPM_GPG_FINGERPRINT=$fingerprint" >> "$GITHUB_ENV"
+
+      - name: Build packages with the disposable key
+        env:
+          GNUPGHOME: ${{ runner.temp }}/veyra-ci-gnupg
+        run: bash scripts/build-rpm-repo.sh "$RUNNER_TEMP/veyra-rpm-repo/x86_64"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veyra-rpm-build-${{ github.sha }}
+          path: ${{ runner.temp }}/veyra-rpm-repo/x86_64/
+          retention-days: 2
+          if-no-files-found: error
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: fedora:44
+    permissions:
+      contents: write
+    steps:
+      - name: Install RPM signing and release tools
+        run: dnf -y install rpm-sign rpm createrepo_c gnupg2 tar gzip gh coreutils
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: veyra-rpm-build-${{ github.sha }}
+          path: ${{ runner.temp }}/veyra-rpm-repo/x86_64
+
+      - name: Validate packages before loading the release key
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rpms=("$RUNNER_TEMP/veyra-rpm-repo/x86_64"/*.rpm)
+          test "${#rpms[@]}" -gt 0
+          for rpm_file in "${rpms[@]}"; do
+            rpm -qp --qf '%{NAME} %{VERSION} %{ARCH}\n' "$rpm_file"
+          done
+
+      - name: Sign RPMs and repository metadata with the release key
+        env:
+          GNUPGHOME: ${{ runner.temp }}/veyra-release-gnupg
+          VEYRA_RPM_GPG_PRIVATE_KEY_B64: ${{ secrets.VEYRA_RPM_GPG_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$VEYRA_RPM_GPG_PRIVATE_KEY_B64" || {
+            echo 'Set VEYRA_RPM_GPG_PRIVATE_KEY_B64 before publishing signed RPM releases.' >&2
+            exit 1
+          }
+          install -d -m 0700 "$GNUPGHOME"
+          key_file="$RUNNER_TEMP/veyra-rpm-private-key.asc"
+          printf '%s' "$VEYRA_RPM_GPG_PRIVATE_KEY_B64" | base64 --decode > "$key_file"
+          chmod 0600 "$key_file"
+          gpg --batch --import "$key_file"
+          rm -f "$key_file"
+          fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+          test -n "$fingerprint"
+          repo_dir="$RUNNER_TEMP/veyra-rpm-repo/x86_64"
+          for rpm_file in "$repo_dir"/*.rpm; do
+            rpmsign --define "_gpg_name $fingerprint" --define "_gpg_path $GNUPGHOME" --resign "$rpm_file"
+          done
+          public_key="$repo_dir/RPM-GPG-KEY-VEYRA"
+          gpg --batch --armor --export "$fingerprint" > "$public_key"
+          verify_db="$RUNNER_TEMP/veyra-release-rpmdb"
+          install -d "$verify_db"
+          rpm --dbpath "$verify_db" --initdb
+          rpm --dbpath "$verify_db" --import "$public_key"
+          for rpm_file in "$repo_dir"/*.rpm; do
+            rpm --dbpath "$verify_db" --checksig --verbose "$rpm_file"
+          done
+          rm -rf "$repo_dir/repodata"
+          createrepo_c --database --checksum sha256 "$repo_dir"
+          gpg --batch --yes --local-user "$fingerprint" --armor --detach-sign \
+            --output "$repo_dir/repodata/repomd.xml.asc" "$repo_dir/repodata/repomd.xml"
+          gpg --batch --verify "$repo_dir/repodata/repomd.xml.asc" "$repo_dir/repodata/repomd.xml"
+          (cd "$repo_dir" && sha256sum ./*.rpm RPM-GPG-KEY-VEYRA > SHA256SUMS)
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP/veyra-rpm-repo" \
+            -czf "$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz" x86_64
+          repo_archive="$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz"
+          sha256sum "$repo_archive" > "$repo_archive.sha256"
+
+      - name: Create GitHub Release with signed RPMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo_dir="$RUNNER_TEMP/veyra-rpm-repo/x86_64"
+          gh release create "$GITHUB_REF_NAME" \
+            "$repo_dir"/*.rpm \
+            "$repo_dir/RPM-GPG-KEY-VEYRA" \
+            "$repo_dir/SHA256SUMS" \
+            "$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz" \
+            "$RUNNER_TEMP/veyra-rpm-repo-${GITHUB_REF_NAME}-x86_64.tar.gz.sha256" \
+            --title "Veyra RPM packages ${GITHUB_REF_NAME#rpm-v}" \
+            --notes "Signed Veyra RPM packages built from ${GITHUB_SHA} in Fedora 44. Fedora packages remain in the official Fedora repositories."
