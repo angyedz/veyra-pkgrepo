@@ -10,7 +10,7 @@ on:
       - '.github/workflows/source-checks.yml'
       - '.github/workflows/packages.yml'
   pull_request:
-    branches: [main]
+    branches: [main, feature/first-party-rpms]
     paths:
       - 'rpms/**'
       - 'sources/**'
@@ -47,3 +47,5 @@ jobs:
             test ! -L "${source_dir%/}"
             printf 'Validated source tree %s\n' "$source_dir"
           done
+          python3 -m py_compile sources/veyra-v-dri/usr/bin/v-dri
+          python3 -m unittest discover -s sources/veyra-v-dri/tests -v
