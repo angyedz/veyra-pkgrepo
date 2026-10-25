@@ -52,6 +52,7 @@ DEPLOYMENT_BINDING_DIR = VPKG_STATE_DIR / "deployments"
 PENDING_UPDATE_FILE = VPKG_STATE_DIR / "pending.json"
 USER_APP_SYSEXT_LINK = SYSTEM_EXTENSION_LINK_DIR / "vpkg-apps"
 USER_APP_EXTENSION_NAME = "vpkg-apps"
+VPKG_POLICY_FILE = Path("/usr/share/veyra/vpkg/protected-core.json")
 PROC_CMDLINE = Path("/proc/cmdline")
 PROC_BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 FEDORA_RELEASE = "44"
@@ -65,77 +66,69 @@ ROOTHASH_RE = re.compile(r"^[0-9a-f]{64}$")
 RPM_EVR_RE = re.compile(
     r"^(?:0|[1-9][0-9]*):[A-Za-z0-9][A-Za-z0-9.+_~^]*-[A-Za-z0-9][A-Za-z0-9.+_~^]*$"
 )
-BLOCKED_PACKAGE_PREFIXES = (
-    "kernel",
-    "akmod-",
-    "kmod-",
-    "dracut",
-    "systemd",
-    "grub",
-    "shim",
-    "bootupd",
-    "grubby",
-    "initramfs",
-    "mkinitrd",
-    "efibootmgr",
-    "nvidia",
-    "xorg-x11-drv-",
-    "mesa-",
-    "veyra-",
-)
-BLOCKED_PACKAGE_NAMES = {
-    "basesystem",
-    "filesystem",
-    "linux-firmware",
-    "amd-gpu-firmware",
-    "nvidia-gpu-firmware",
-    "intel-gpu-firmware",
-    "rpm",
-    "rpm-libs",
-    "dnf",
-    "dnf5",
-    "systemd-boot-unsigned",
-    "systemd-bootctl",
-    "bootc",
-}
-BLOCKED_PATH_PREFIXES = (
-    "/boot/",
-    "/efi/",
-    "/usr/lib/modules/",
-    "/usr/lib/kernel/",
-    "/usr/lib/systemd/boot/",
-    "/usr/lib/systemd/system-generators/",
-    "/usr/lib/systemd/user-generators/",
-    "/usr/lib/dracut/",
-    "/usr/lib/initcpio/",
-    "/usr/lib/sysimage/",
-    "/usr/lib/firmware/",
-    "/usr/lib/dri/",
-    "/usr/lib64/dri/",
-    "/usr/lib/xorg/modules/drivers/",
-    "/usr/lib64/xorg/modules/drivers/",
-    "/usr/share/vulkan/icd.d/",
-    "/usr/lib64/vulkan/",
-    "/usr/lib/extension-release.d/",
-    "/etc/kernel/",
-    "/etc/dracut.conf.d/",
-    "/etc/systemd/boot/",
-)
-BLOCKED_EXACT_PATHS = {
-    "/usr/bin/init",
-    "/usr/sbin/init",
-    "/usr/lib/os-release",
-    "/usr/lib/systemd/systemd",
-    "/usr/lib/systemd/systemd-boot",
-}
-
-
 class VpkgError(RuntimeError):
     pass
 
 
 class VpkgReject(VpkgError):
     pass
+
+
+def load_vpkg_policy() -> dict[str, object]:
+    """Load the immutable, versioned policy that defines Veyra's protected core."""
+    policy = read_json_object(VPKG_POLICY_FILE, "protected-core policy")
+    if policy.get("schema") != 1 or policy.get("supported_base") != {
+        "id": "fedora",
+        "version_id": FEDORA_RELEASE,
+    }:
+        raise VpkgError("The protected-core policy is malformed or targets an unsupported base.")
+    packages = policy.get("protected_packages")
+    paths = policy.get("payload_paths")
+    if not isinstance(packages, dict) or not isinstance(paths, dict):
+        raise VpkgError("The protected-core policy is missing package or payload rules.")
+    if set(packages) != {"names", "prefixes"} or set(paths) != {
+        "allowed_prefixes", "denied_exact", "denied_prefixes"
+    }:
+        raise VpkgError("The protected-core policy has unknown or missing rule sections.")
+
+    def string_list(section: dict[str, object], key: str) -> list[str]:
+        value = section.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise VpkgError(f"The protected-core policy has an invalid {key} list.")
+        if len(set(value)) != len(value):
+            raise VpkgError(f"The protected-core policy has duplicate entries in {key}.")
+        return value
+
+    names = string_list(packages, "names")
+    prefixes = string_list(packages, "prefixes")
+    allowed = string_list(paths, "allowed_prefixes")
+    denied_exact = string_list(paths, "denied_exact")
+    denied_prefixes = string_list(paths, "denied_prefixes")
+    if not names or not prefixes or not allowed:
+        raise VpkgError("The protected-core policy must define protected packages and payload roots.")
+    if any(prefix not in {"/usr/", "/opt/"} for prefix in allowed):
+        raise VpkgError("The protected-core policy may only allow additive /usr and /opt payloads.")
+    if any(not RPM_NAME_RE.fullmatch(name) or name != name.lower() for name in names):
+        raise VpkgError("The protected-core policy contains an invalid protected package name.")
+    if any(
+        not re.fullmatch(r"[a-z0-9][a-z0-9+_.-]*", prefix)
+        for prefix in prefixes
+    ):
+        raise VpkgError("The protected-core policy contains an invalid package prefix.")
+    for path in denied_exact:
+        if not path.startswith("/") or posixpath.normpath(path) != path or ".." in path.split("/"):
+            raise VpkgError("The protected-core policy contains an invalid denied path.")
+    for path in allowed + denied_prefixes:
+        if (
+            not path.startswith("/")
+            or not path.endswith("/")
+            or posixpath.normpath(path[:-1]) + "/" != path
+            or ".." in path.split("/")
+        ):
+            raise VpkgError("The protected-core policy contains an invalid path prefix.")
+    if set(allowed) & set(denied_prefixes):
+        raise VpkgError("The protected-core policy has contradictory allowed and denied paths.")
+    return policy
 
 
 def resolve_path_in_root(root: Path, relative_path: str) -> Path:
@@ -283,8 +276,11 @@ def validate_user_package_name(name: str) -> None:
     if not RPM_NAME_RE.fullmatch(name):
         raise VpkgError(f"Invalid Fedora/RPM Fusion package name: {name!r}")
     lowered = name.lower()
-    if lowered in BLOCKED_PACKAGE_NAMES or any(
-        lowered.startswith(prefix) for prefix in BLOCKED_PACKAGE_PREFIXES
+    policy = load_vpkg_policy()
+    package_policy = policy["protected_packages"]
+    assert isinstance(package_policy, dict)
+    if lowered in package_policy["names"] or any(
+        lowered.startswith(prefix) for prefix in package_policy["prefixes"]
     ):
         raise VpkgError(
             f"REJECT: refusing {name}: kernels, graphics drivers, boot components, and base-system packages "
@@ -294,6 +290,12 @@ def validate_user_package_name(name: str) -> None:
 
 def validate_user_package_paths(paths: list[str]) -> None:
     """Require a third-party RPM payload to fit an additive /usr or /opt layer."""
+    policy = load_vpkg_policy()
+    path_policy = policy["payload_paths"]
+    assert isinstance(path_policy, dict)
+    denied_exact = path_policy["denied_exact"]
+    denied_prefixes = path_policy["denied_prefixes"]
+    allowed_prefixes = path_policy["allowed_prefixes"]
     for path in paths:
         normalized = posixpath.normpath(path)
         if (
@@ -303,13 +305,13 @@ def validate_user_package_paths(paths: list[str]) -> None:
             or "\x00" in path
         ):
             raise VpkgError(f"Refusing RPM with unsafe payload path: {path!r}")
-        if path in BLOCKED_EXACT_PATHS or any(
-            path.startswith(prefix) for prefix in BLOCKED_PATH_PREFIXES
+        if path in denied_exact or any(
+            path.startswith(prefix) for prefix in denied_prefixes
         ):
             raise VpkgError(f"Refusing RPM payload that changes a protected system path: {path}")
         if path in {"/usr", "/opt"}:
             continue
-        if not path.startswith(("/usr/", "/opt/")):
+        if not any(path.startswith(prefix) for prefix in allowed_prefixes):
             raise VpkgError(
                 f"Refusing RPM payload outside /usr or /opt: {path}. "
                 "This package cannot be safely exposed as an additive system extension."
@@ -1375,11 +1377,19 @@ def classify_user_app_transaction(
         for name, base_nevras in base_records.items()
         if name != "gpg-pubkey" and installed.get(name, set()) != base_nevras
     )
+    try:
+        policy = load_vpkg_policy()
+    except VpkgError as error:
+        return "REJECT", {}, f"could not load protected-core policy: {error}"
+    package_policy = policy["protected_packages"]
+    assert isinstance(package_policy, dict)
+    protected_names = package_policy["names"]
+    protected_prefixes = package_policy["prefixes"]
     if changed_base:
         protected = [
             name for name in changed_base
-            if name.lower() in BLOCKED_PACKAGE_NAMES
-            or any(name.lower().startswith(prefix) for prefix in BLOCKED_PACKAGE_PREFIXES)
+            if name.lower() in protected_names
+            or any(name.lower().startswith(prefix) for prefix in protected_prefixes)
         ]
         if protected:
             return (
@@ -1390,11 +1400,11 @@ def classify_user_app_transaction(
                 + "; these components can only change through an official A/B system update.",
             )
         return (
-            "REJECT",
+            "STAGED",
             {},
-            "transaction changes base package(s) "
+            "transaction changes non-core base package(s) "
             + ", ".join(changed_base)
-            + "; this would require staged system-package generations, which vpkg does not support yet.",
+            + "; it requires an immutable system-generation backend and cannot be activated by the current app-layer backend.",
         )
 
     added: dict[str, str] = {}
