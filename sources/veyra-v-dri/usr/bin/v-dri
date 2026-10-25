@@ -43,6 +43,18 @@ ISSUE_KERNEL_MISMATCH = "kernel-version-mismatch"
 ISSUE_SIGNATURE_POLICY = "module-signature-policy-unknown"
 MODULE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_+][A-Za-z0-9_+-]*\Z")
 MODALIAS_PATTERN = re.compile(r"[A-Za-z0-9_:+.,-]+\Z")
+DRIVER_LOG_MARKERS = (
+    "firmware: failed to load",
+    "failed to load firmware",
+    "module verification failed",
+    "signature and/or required key missing",
+    "failed to insert module",
+    "unknown symbol",
+    "drm: failed",
+    "amdgpu: failed",
+    "i915: failed",
+    "nouveau: failed",
+)
 
 
 def read_text(path: Path) -> str | None:
@@ -133,7 +145,28 @@ def signature_enforcement(sys_root: Path, proc_root: Path) -> str:
     return "unknown"
 
 
-def collect_inventory(root: Path) -> dict[str, Any]:
+def collect_kernel_diagnostics() -> dict[str, Any]:
+    output, error = command_output(
+        ["journalctl", "--dmesg", "--boot", "--lines=2000", "--no-pager", "--output=cat"]
+    )
+    if output is None:
+        return {"available": False, "findings": [], "error": error}
+    findings: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        normalized = line.casefold()
+        if not any(marker in normalized for marker in DRIVER_LOG_MARKERS):
+            continue
+        clean = "".join(char for char in line if char.isprintable()).strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            findings.append(clean[:500])
+        if len(findings) >= 40:
+            break
+    return {"available": True, "findings": findings, "error": None}
+
+
+def collect_inventory(root: Path, include_kernel_logs: bool = False) -> dict[str, Any]:
     sys_root = root / "sys"
     proc_root = root / "proc"
     running_kernel = read_text(proc_root / "sys/kernel/osrelease")
@@ -212,6 +245,7 @@ def collect_inventory(root: Path) -> dict[str, Any]:
         "module_signature_enforcement": enforcement,
         "devices": devices,
         "errors": errors,
+        "kernel_diagnostics": collect_kernel_diagnostics() if include_kernel_logs else None,
     }
 
 
@@ -220,6 +254,15 @@ def render_text(report: dict[str, Any]) -> str:
     secure_boot = report["secure_boot"]
     lines.append(f"Secure Boot: {'enabled' if secure_boot else 'disabled' if secure_boot is False else 'unknown'}")
     lines.append(f"Module signature enforcement: {report['module_signature_enforcement']}")
+    diagnostics = report.get("kernel_diagnostics")
+    if diagnostics is not None:
+        if not diagnostics["available"]:
+            lines.append("Kernel log: unavailable")
+        elif diagnostics["findings"]:
+            for finding in diagnostics["findings"]:
+                lines.append(f"Kernel finding: {finding}")
+        else:
+            lines.append("Kernel log: no matching driver errors found")
     if not report["devices"]:
         lines.append("No PCI devices found.")
     for device in report["devices"]:
@@ -246,13 +289,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="print versioned JSON")
     parser.add_argument("--root", type=Path, default=Path("/"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    report = collect_inventory(args.root)
+    report = collect_inventory(args.root, include_kernel_logs=args.command == "doctor")
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(render_text(report))
     has_device_issue = any(device["issues"] for device in report["devices"])
-    if args.command == "doctor" and (has_device_issue or report["errors"]):
+    log_findings = bool(
+        report.get("kernel_diagnostics")
+        and report["kernel_diagnostics"].get("findings")
+    )
+    if args.command == "doctor" and (has_device_issue or report["errors"] or log_findings):
         return 1
     return 0
 

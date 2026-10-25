@@ -32,6 +32,9 @@ interpreted as proof that a device is unsupported.
 
 The JSON output is versioned and stable enough for a future GUI or support
 bundle. Text output is intended for a person troubleshooting a device.
+`doctor` reads at most the latest 2,000 kernel-journal lines from the current
+boot and returns at most 40 filtered findings. It does not save or upload logs;
+the journal may be unavailable to an unprivileged user.
 
 ## Trust and activation boundary
 
@@ -52,7 +55,8 @@ signing, provenance, OTA-binding, and rollback design.
 - `v-dri status [--json]`: inventory detected PCI devices and
   report their bound driver and available alias-matched module candidates.
 - `v-dri doctor [--json]`: the same inventory with actionable policy and
-  compatibility findings; exits 1 if a detected device has a driver issue.
+  compatibility findings plus recent driver-related kernel log errors; exits
+  1 if a detected device has a driver issue.
 - `v-dri --help`: show supported commands.
 
 There is intentionally no `install`, `enable`, `disable`, or `load` command in

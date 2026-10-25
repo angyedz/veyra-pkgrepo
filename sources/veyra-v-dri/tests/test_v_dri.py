@@ -121,6 +121,23 @@ class VeyraDriverInventoryTests(unittest.TestCase):
             report = v_dri.collect_inventory(self.root)
         self.assertIn(v_dri.ISSUE_SIGNATURE_POLICY, report["devices"][0]["issues"])
 
+    def test_kernel_diagnostics_only_return_driver_related_failures(self):
+        log = "\n".join(
+            (
+                "systemd[1]: Started session 1.",
+                "amdgpu: failed to load firmware amdgpu/test.bin",
+                "module verification failed: signature and/or required key missing",
+            )
+        )
+        with patch.object(v_dri, "command_output", return_value=(log, None)) as run:
+            report = v_dri.collect_kernel_diagnostics()
+        run.assert_called_once_with(
+            ["journalctl", "--dmesg", "--boot", "--lines=2000", "--no-pager", "--output=cat"]
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual(len(report["findings"]), 2)
+        self.assertTrue(all("amdgpu" in line or "module verification" in line for line in report["findings"]))
+
 
 if __name__ == "__main__":
     unittest.main()
