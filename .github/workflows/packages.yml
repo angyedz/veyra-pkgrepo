@@ -69,7 +69,9 @@ jobs:
           gpgkey=file://$repo_dir/RPM-GPG-KEY-VEYRA
           metadata_expire=0
           EOF
-          dnf -y --disablerepo='*' --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update
+          # Keep Fedora 44 enabled for runtime dependencies; the three Veyra RPMs
+          # are still resolved from the signed local snapshot repository.
+          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update
           test -s /usr/share/veyra/release
           test -x /usr/bin/vpkg
           test -s /usr/lib/veyra/vpkg_libdnf.py
