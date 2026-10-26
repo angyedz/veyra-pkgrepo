@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install spec parser
-        run: dnf -y install rpm-build bash
+        run: dnf -y install rpm-build bash python3
       - name: Validate package specs and build script
         run: |
           set -euo pipefail
@@ -42,6 +42,8 @@ jobs:
             echo "Validated $spec"
           done
           test -s rpms/veyra-release/SOURCES/release.txt
+          python3 -m py_compile sources/veyra-vforge/usr/bin/vforge
+          python3 -m unittest discover -s tests -p 'test_vforge.py' -v
           for source_dir in sources/*/; do
             test -d "$source_dir" || continue
             test ! -L "${source_dir%/}"

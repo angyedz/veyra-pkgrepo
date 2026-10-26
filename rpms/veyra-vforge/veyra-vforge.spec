@@ -1,6 +1,6 @@
 Name:           veyra-vforge
 Version:        0.1.0
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Persistent isolated development environments for Veyra Linux
 License:        LicenseRef-Veyra
 BuildArch:      noarch
@@ -24,6 +24,9 @@ install -Dpm0755 usr/bin/vforge %{buildroot}%{_bindir}/vforge
 %{_bindir}/vforge
 
 %changelog
+* Mon Oct 26 2026 Veyra contributors <packages@veyra.invalid> - 0.1.0-4
+- Sync the packaged Vforge CLI, project environments, package commands, snapshots and OTA-base checks.
+
 * Mon Oct 26 2026 Veyra contributors <packages@veyra.invalid> - 0.1.0-3
 - Clean up runtime mounts and safely bind device and regular-file paths.
 

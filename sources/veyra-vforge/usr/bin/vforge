@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fcntl
 import json
 import os
 import re
@@ -14,8 +15,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import uuid
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
@@ -25,6 +28,9 @@ PROJECT_CONFIG = ".vforge.toml"
 PERMISSION_FILE = "approved-mounts.json"
 FEDORA_RELEASE = "44"
 VEYRA_IMAGE_ID = "veyra-next"
+PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.-]{0,254}$")
+SNAPSHOT_ID_RE = re.compile(r"^[0-9]{10,}-[0-9a-f]{8}$")
+MAX_PROJECT_PACKAGES = 128
 
 
 class VforgeError(Exception):
@@ -142,6 +148,22 @@ def store_root() -> Path:
     return root.resolve()
 
 
+def validate_base_identity(value: object) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"image_id", "image_version", "base_digest"}
+        or value.get("image_id") != VEYRA_IMAGE_ID
+        or not isinstance(value.get("image_version"), str)
+        or not re.fullmatch(r"[A-Za-z0-9._+-]+", value["image_version"])
+        or not isinstance(value.get("base_digest"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["base_digest"])
+    ):
+        raise VforgeError("environment metadata has an invalid Veyra base identity")
+    return value
+
+
 def validate_name(name: str) -> str:
     if not NAME_RE.fullmatch(name):
         raise VforgeError("environment name must use lowercase letters, digits, dots, dashes, or underscores")
@@ -171,6 +193,9 @@ def environment_metadata(path: Path) -> dict:
     verify_private_directory(path / "upper", "OverlayFS upper directory")
     verify_private_directory(path / "work", "OverlayFS work directory")
     validate_mount_records(value.get("mounts", []))
+    network = value.setdefault("network", "isolated")
+    if not isinstance(network, str) or network not in {"isolated", "shared"}:
+        raise VforgeError("environment metadata has an invalid network permission")
     project = value.get("project")
     if project is None:
         expected = store_root() / "environments" / name
@@ -189,6 +214,8 @@ def environment_metadata(path: Path) -> dict:
     root_id = value.get("root_id")
     if root_id is not None and (not isinstance(root_id, str) or not re.fullmatch(r"[0-9a-f]{32}", root_id)):
         raise VforgeError("environment metadata has an invalid root identity")
+    if "base_identity" in value:
+        validate_base_identity(value["base_identity"])
     if value.get("schema") == 1 or root_id is None:
         value["schema"] = 2
         value["root_id"] = uuid.uuid4().hex
@@ -198,6 +225,45 @@ def environment_metadata(path: Path) -> dict:
 
 def write_metadata(path: Path, metadata: dict) -> None:
     write_private_json(path / "environment.json", metadata, "Vforge environment metadata")
+
+
+@contextmanager
+def environment_lock(path: Path, *, exclusive: bool = False):
+    verify_private_directory(path, "Vforge environment")
+    lock_path = path / ".vforge.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise VforgeError(f"cannot safely open Vforge environment lock {lock_path}: {error}") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise VforgeError(f"Vforge environment lock must be a private file owned by the current user: {lock_path}")
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if exclusive:
+            operation |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(descriptor, operation)
+        except BlockingIOError as error:
+            raise VforgeError("environment has active sessions; close them before snapshot, rollback, or upgrade") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def ensure_environment_base(path: Path, metadata: dict) -> dict[str, str]:
+    current = current_base_identity(metadata)
+    recorded = validate_base_identity(metadata.get("base_identity"))
+    if recorded is None:
+        metadata["base_identity"] = current
+        write_metadata(path, metadata)
+    elif recorded != current:
+        raise VforgeError(
+            f"Veyra base changed from {recorded['image_version']} to {current['image_version']}; "
+            f"run `vforge upgrade {metadata['name']}` before entering this environment"
+        )
+    return current
 
 
 def run(command: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess:
@@ -272,36 +338,62 @@ def normalize_mounts(items: object) -> list[dict[str, str]]:
     return result
 
 
-def project_mount_approvals(project: Path) -> list[dict[str, str]]:
+def project_permission_state() -> dict:
     approval_path = config_directory() / PERMISSION_FILE
     state = read_private_json_optional(
-        approval_path, "Vforge mount approvals", {"schema": 1, "projects": {}}
+        approval_path, "Vforge permission approvals", {"schema": 1, "projects": {}, "network_projects": {}}
     )
-    if not isinstance(state, dict) or state.get("schema") != 1 or not isinstance(state.get("projects"), dict):
-        raise VforgeError("Vforge mount approval state is malformed")
-    for project_name, mounts in state["projects"].items():
+    if (not isinstance(state, dict) or state.get("schema") != 1
+            or not isinstance(state.get("projects"), dict)
+            or not isinstance(state.get("network_projects", {}), dict)):
+        raise VforgeError("Vforge permission approval state is malformed")
+    state.setdefault("network_projects", {})
+    for project_name in state["projects"]:
         if not isinstance(project_name, str) or not Path(project_name).is_absolute():
-            raise VforgeError("Vforge mount approval state contains an invalid project path")
-        state["projects"][project_name] = validate_mount_records(mounts)
-    return state["projects"].get(str(project), [])
+            raise VforgeError("Vforge permission approval state contains an invalid project path")
+    state["projects"] = {project_name: validate_mount_records(mounts)
+                          for project_name, mounts in state["projects"].items()}
+    network_projects = state.get("network_projects", {})
+    for project_name, network in network_projects.items():
+        if (not isinstance(project_name, str) or not Path(project_name).is_absolute()
+                or network != "shared"):
+            raise VforgeError("Vforge permission approval state contains an invalid network grant")
+    return state
 
 
-def authorize_project_mounts(name: str, project: Path, requested: list[dict[str, str]]) -> None:
+def project_mount_approvals(project: Path) -> list[dict[str, str]]:
+    return project_permission_state()["projects"].get(str(project), [])
+
+
+def project_network_approval(project: Path) -> str:
+    return project_permission_state()["network_projects"].get(str(project), "isolated")
+
+
+def authorize_project_permissions(
+    name: str,
+    project: Path,
+    requested_mounts: list[dict[str, str]],
+    requested_network: str,
+) -> None:
     approval_path = config_directory() / PERMISSION_FILE
-    state = read_private_json_optional(
-        approval_path, "Vforge mount approvals", {"schema": 1, "projects": {}}
-    )
-    if not isinstance(state, dict) or state.get("schema") != 1 or not isinstance(state.get("projects"), dict):
-        raise VforgeError("Vforge mount approval state is malformed")
-    approved = project_mount_approvals(project)
-    added = [item for item in requested if item not in approved]
-    if added:
-        confirm_permissions(name, added)
-    if requested:
-        state["projects"][str(project)] = requested
+    state = project_permission_state()
+    project_key = str(project)
+    approved_mounts = state["projects"].get(project_key, [])
+    added_mounts = [mount for mount in requested_mounts if mount not in approved_mounts]
+    if added_mounts:
+        confirm_permissions(name, added_mounts)
+    if requested_network == "shared" and state["network_projects"].get(project_key) != "shared":
+        confirm_network_permission(name)
+
+    if requested_mounts:
+        state["projects"][project_key] = requested_mounts
     else:
-        state["projects"].pop(str(project), None)
-    write_private_json(approval_path, state, "Vforge mount approvals")
+        state["projects"].pop(project_key, None)
+    if requested_network == "shared":
+        state["network_projects"][project_key] = "shared"
+    else:
+        state["network_projects"].pop(project_key, None)
+    write_private_json(approval_path, state, "Vforge permission approvals")
 
 
 def confirm_permissions(name: str, requested: list[dict[str, str]]) -> None:
@@ -313,21 +405,45 @@ def confirm_permissions(name: str, requested: list[dict[str, str]]) -> None:
         raise VforgeError("host mount permission was not granted")
 
 
-def create(name: str, *, project: Path | None = None, mounts: list[dict[str, str]] | None = None) -> Path:
+def confirm_network_permission(name: str) -> None:
+    print(
+        f"Environment '{name}' requests shared host networking. "
+        "It can reach the internet and services on the local network."
+    )
+    if not sys.stdin.isatty():
+        raise VforgeError("shared network access requires interactive approval")
+    if input("Allow shared network access? [y/N] ").strip().lower() not in {"y", "yes"}:
+        raise VforgeError("shared network access was not granted")
+
+
+def create(
+    name: str,
+    *,
+    project: Path | None = None,
+    mounts: list[dict[str, str]] | None = None,
+    network: str = "isolated",
+) -> Path:
     validate_name(name)
+    if not isinstance(network, str) or network not in {"isolated", "shared"}:
+        raise VforgeError("network must be isolated or shared")
     if project is not None:
         project = project.resolve(strict=True)
         if not project.is_dir():
             raise VforgeError("project path must be a directory")
         ensure_private_directory(project / ".vforge")
         requested = validate_mount_records(mounts or [])
-        authorize_project_mounts(name, project, requested)
+        authorize_project_permissions(name, project, requested, network)
     else:
         requested = validate_mount_records(mounts or [])
         if requested:
             raise VforgeError("host mounts can only be configured in a project .vforge.toml file")
         ensure_private_directory(store_root())
         ensure_private_directory(store_root() / "environments")
+        if network == "shared":
+            existing = environment_path(name)
+            previous_network = environment_metadata(existing).get("network", "isolated") if existing.exists() else "isolated"
+            if previous_network != "shared":
+                confirm_network_permission(name)
     path = environment_path(name, project=project)
     if path.is_symlink():
         raise VforgeError("project Vforge state may not use symlinks")
@@ -336,8 +452,10 @@ def create(name: str, *, project: Path | None = None, mounts: list[dict[str, str
         if current.get("project") != (str(project) if project else None):
             raise VforgeError(f"environment '{name}' already belongs to a different project")
         previous = current.get("mounts", [])
-        if requested != previous:
+        previous_network = current.get("network", "isolated")
+        if requested != previous or previous_network != network:
             current["mounts"] = requested
+            current["network"] = network
             write_metadata(path, current)
         print(f"Environment '{name}' already exists at {path}")
         return path
@@ -355,18 +473,35 @@ def create(name: str, *, project: Path | None = None, mounts: list[dict[str, str
         "work": str(path / "work"),
         "project": str(project) if project else None,
         "mounts": requested,
+        "network": network,
+        "base_identity": None,
     }
     write_metadata(path, metadata)
     print(f"Created native OverlayFS environment '{name}' at {path}")
     return path
 
 
-def project_settings(project: Path) -> tuple[str, list[dict[str, str]]]:
+def project_packages(value: object) -> list[str]:
+    if not isinstance(value, dict) or set(value) - {"system"}:
+        raise VforgeError("[packages] must be a table containing only system")
+    requested = value.get("system", [])
+    if not isinstance(requested, list) or len(requested) > MAX_PROJECT_PACKAGES:
+        raise VforgeError(f"packages.system must be a list of at most {MAX_PROJECT_PACKAGES} RPM package names")
+    if any(not isinstance(name, str) or not PACKAGE_NAME_RE.fullmatch(name) for name in requested):
+        raise VforgeError("packages.system entries must be valid RPM package names")
+    if len(set(requested)) != len(requested):
+        raise VforgeError("packages.system must not contain duplicate package names")
+    if any(name.startswith("veyra-") for name in requested):
+        raise VforgeError("packages.system can contain Fedora or RPM Fusion packages, not Veyra system extensions")
+    return requested
+
+
+def project_settings(project: Path) -> tuple[str, list[dict[str, str]], str, list[str]]:
     config = project / PROJECT_CONFIG
     try:
         descriptor = os.open(config, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
-        return project.name.lower().replace(" ", "-")[:55] or "project", []
+        return project.name.lower().replace(" ", "-")[:55] or "project", [], "isolated", []
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise VforgeError("project Vforge configuration may not be a symlink") from error
@@ -384,6 +519,7 @@ def project_settings(project: Path) -> tuple[str, list[dict[str, str]]]:
             os.close(descriptor)
     environment = value.get("environment", {})
     permissions = value.get("permissions", {})
+    packages = value.get("packages", {})
     if not isinstance(environment, dict) or not isinstance(permissions, dict):
         raise VforgeError("[environment] and [permissions] must be tables")
     name = validate_name(str(environment.get("name", project.name.lower().replace(" ", "-")[:55])))
@@ -393,24 +529,71 @@ def project_settings(project: Path) -> tuple[str, list[dict[str, str]]]:
     if home_mode != "project-only":
         raise VforgeError("native Vforge currently supports project-only Home access")
     mounts = normalize_mounts(permissions.get("mounts", []))
-    return name, mounts
+    network = permissions.get("network", "isolated")
+    if not isinstance(network, str) or network not in {"isolated", "shared"}:
+        raise VforgeError("permissions.network must be isolated or shared")
+    return name, mounts, network, project_packages(packages)
+
+
+def project_environment(cwd: Path) -> tuple[Path, list[str]]:
+    project = cwd.resolve()
+    name, mounts, network, packages = project_settings(project)
+    return create(name, project=project, mounts=mounts, network=network), packages
 
 
 def project_up(cwd: Path) -> Path:
-    project = cwd.resolve()
-    name, mounts = project_settings(project)
-    return create(name, project=project, mounts=mounts)
+    path, packages = project_environment(cwd)
+    if packages:
+        status = namespace_command(path, ["vpkg", "install", *packages])
+        if status:
+            metadata = environment_metadata(path)
+            hint = (
+                ' Request [permissions].network = "shared" if the packages need to be downloaded.'
+                if metadata.get("network", "isolated") == "isolated" else ""
+            )
+            raise VforgeError(f"could not install project packages (vpkg exited with status {status}).{hint}")
+    return path
 
 
-def namespace_command(path: Path, command: Sequence[str]) -> int:
+def namespace_command(
+    path: Path,
+    command: Sequence[str],
+    *,
+    lock_held: bool = False,
+    allow_base_mismatch: bool = False,
+) -> int:
+    if lock_held:
+        return _namespace_command_locked(path, command, allow_base_mismatch=allow_base_mismatch)
+    with environment_lock(path):
+        return _namespace_command_locked(path, command, allow_base_mismatch=allow_base_mismatch)
+
+
+def _namespace_command_locked(
+    path: Path,
+    command: Sequence[str],
+    *,
+    allow_base_mismatch: bool = False,
+) -> int:
     metadata = environment_metadata(path)
     verify_project_mount_approvals(metadata)
+    current = current_base_identity(metadata)
+    recorded = validate_base_identity(metadata.get("base_identity"))
+    if allow_base_mismatch:
+        pass
+    elif recorded is None:
+        metadata["base_identity"] = current
+        write_metadata(path, metadata)
+    elif recorded != current:
+        raise VforgeError(
+            f"Veyra base changed from {recorded['image_version']} to {current['image_version']}; "
+            f"run `vforge upgrade {metadata['name']}` before entering this environment"
+        )
     if not command:
         command = ["/bin/bash", "--login"]
-    arguments = [
-        "unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork", "--net",
-        sys.executable, str(Path(__file__).resolve()), "_run", str(path), *command,
-    ]
+    arguments = ["unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork"]
+    if metadata["network"] == "isolated":
+        arguments.append("--net")
+    arguments.extend([sys.executable, str(Path(__file__).resolve()), "_run", str(path), *command])
     try:
         result = subprocess.run(arguments)
     except FileNotFoundError as error:
@@ -424,9 +607,15 @@ def verify_project_mount_approvals(metadata: dict) -> None:
     project = metadata.get("project")
     if project is None:
         return
-    approved = project_mount_approvals(Path(project))
+    project_path = Path(project)
+    _, configured_mounts, configured_network, _ = project_settings(project_path)
+    if configured_mounts != metadata.get("mounts", []) or configured_network != metadata.get("network", "isolated"):
+        raise VforgeError("project Vforge permissions changed; run `vforge up` to review and apply them")
+    approved = project_mount_approvals(project_path)
     if any(mount not in approved for mount in metadata.get("mounts", [])):
         raise VforgeError("project environment contains unapproved host mounts; review .vforge.toml with `vforge up`")
+    if metadata.get("network", "isolated") == "shared" and project_network_approval(project_path) != "shared":
+        raise VforgeError("shared network permission is not approved; review .vforge.toml with `vforge up`")
 
 
 def mount_in_namespace(
@@ -464,6 +653,41 @@ def mount_in_namespace(
         raise VforgeError(f"cannot safely open mount source {source}: {error}") from error
     finally:
         os.close(descriptor)
+
+
+def mountpoints_below(mountinfo: str, root: Path) -> list[str]:
+    root_path = root.as_posix().rstrip("/") or "/"
+    prefix = root_path if root_path == "/" else root_path + "/"
+    result = []
+    for line in mountinfo.splitlines():
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            raise VforgeError("active Veyra mount table is malformed")
+        mountpoint = fields[4]
+        for escaped, value in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+            mountpoint = mountpoint.replace(escaped, value)
+        if mountpoint != root_path and mountpoint.startswith(prefix):
+            result.append(mountpoint)
+    return sorted(result, key=lambda path: (path.count("/"), path))
+
+
+def unmount_inherited_submounts(
+    root: Path,
+    mountpoints: list[str],
+    mountinfo: str | None = None,
+) -> None:
+    if mountinfo is None:
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise VforgeError("cannot read the Vforge mount table") from error
+    inherited = mountpoints_below(mountinfo, root)
+    # Track every cloned mount before detaching any so cleanup can unwind a
+    # partially detached tree safely if one of the umount operations fails.
+    mountpoints.extend(inherited)
+    for target in reversed(inherited):
+        run(["umount", "--", target])
+        mountpoints.remove(target)
 
 
 def unmount_all(mountpoints: Sequence[str]) -> list[str]:
@@ -529,6 +753,21 @@ def veyra_root_marker(
     }
 
 
+def current_base_identity(metadata: dict) -> dict[str, str]:
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise VforgeError("cannot read the active Veyra mount table") from error
+    verify_immutable_root_mount(mountinfo)
+    marker = veyra_root_marker(metadata, Path("/"))
+    identity = {
+        "image_id": marker["image_id"],
+        "image_version": marker["image_version"],
+        "base_digest": marker["base_digest"],
+    }
+    return validate_base_identity(identity) or {}
+
+
 def verify_immutable_root_mount(mountinfo: str) -> None:
     candidates = []
     for line in mountinfo.splitlines():
@@ -541,6 +780,213 @@ def verify_immutable_root_mount(mountinfo: str) -> None:
         candidates.append((fields[5].split(","), fields[separator + 1]))
     if len(candidates) != 1 or "ro" not in candidates[0][0] or candidates[0][1] != "erofs":
         raise VforgeError("Vforge requires the active Veyra EROFS root to be mounted read-only")
+
+
+def copy_directory(source: Path, destination: Path, description: str) -> None:
+    verify_private_directory(source, description)
+    if destination.exists() or destination.is_symlink():
+        raise VforgeError(f"refusing to replace existing snapshot data: {destination}")
+    run(["cp", "--archive", "--reflink=auto", "--", str(source), str(destination)])
+    verify_private_directory(destination, description)
+
+
+def snapshot_root(path: Path) -> Path:
+    return path / "snapshots"
+
+
+def create_snapshot_locked(
+    path: Path,
+    metadata: dict,
+    base_identity: dict[str, str],
+) -> str:
+    snapshots = snapshot_root(path)
+    ensure_private_directory(snapshots)
+    snapshot_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    staging = snapshots / f".tmp-{uuid.uuid4().hex}"
+    destination = snapshots / snapshot_id
+    staging.mkdir(mode=0o700)
+    try:
+        copy_directory(Path(metadata["upper"]), staging / "upper", "Vforge snapshot upper directory")
+        write_private_json(
+            staging / "snapshot.json",
+            {
+                "schema": 1,
+                "snapshot_id": snapshot_id,
+                "name": metadata["name"],
+                "root_id": metadata["root_id"],
+                "base_identity": base_identity,
+                "created_at": int(time.time()),
+            },
+            "Vforge snapshot metadata",
+        )
+        os.replace(staging, destination)
+        directory_fd = os.open(snapshots, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except (OSError, VforgeError):
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return snapshot_id
+
+
+def read_snapshot(path: Path, snapshot_id: str) -> dict:
+    if not SNAPSHOT_ID_RE.fullmatch(snapshot_id):
+        raise VforgeError("snapshot ID is malformed")
+    metadata = environment_metadata(path)
+    snapshots = snapshot_root(path)
+    verify_private_directory(snapshots, "Vforge snapshots directory")
+    target = snapshots / snapshot_id
+    verify_private_directory(target, "Vforge snapshot")
+    try:
+        value = read_private_json(target / "snapshot.json", "Vforge snapshot metadata")
+    except VforgeError as error:
+        raise VforgeError(f"cannot read Vforge snapshot {snapshot_id}: {error}") from error
+    required = {"schema", "snapshot_id", "name", "root_id", "base_identity", "created_at"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema") != 1
+        or value.get("snapshot_id") != snapshot_id
+        or value.get("name") != metadata["name"]
+        or value.get("root_id") != metadata.get("root_id")
+        or not isinstance(value.get("created_at"), int)
+        or isinstance(value.get("created_at"), bool)
+    ):
+        raise VforgeError(f"Vforge snapshot {snapshot_id} does not belong to this environment")
+    value["base_identity"] = validate_base_identity(value.get("base_identity"))
+    verify_private_directory(target / "upper", "Vforge snapshot upper directory")
+    resolved_root = snapshots.resolve(strict=True)
+    resolved_target = target.resolve(strict=True)
+    if resolved_target == resolved_root or not resolved_target.is_relative_to(resolved_root):
+        raise VforgeError(f"refusing snapshot path outside the environment: {target}")
+    return value
+
+
+def snapshot_records_locked(path: Path) -> list[dict]:
+    snapshots = snapshot_root(path)
+    if not snapshots.exists():
+        return []
+    verify_private_directory(snapshots, "Vforge snapshots directory")
+    records = []
+    for target in snapshots.iterdir():
+        if target.name.startswith(".tmp-"):
+            continue
+        records.append(read_snapshot(path, target.name))
+    return sorted(records, key=lambda item: (item["created_at"], item["snapshot_id"]), reverse=True)
+
+
+def list_snapshots(path: Path) -> list[dict]:
+    with environment_lock(path):
+        environment_metadata(path)
+        return snapshot_records_locked(path)
+
+
+def snapshot_environment(path: Path) -> str:
+    with environment_lock(path, exclusive=True):
+        metadata = environment_metadata(path)
+        verify_project_mount_approvals(metadata)
+        base_identity = ensure_environment_base(path, metadata)
+        snapshot_id = create_snapshot_locked(path, metadata, base_identity)
+    print(f"Created Vforge snapshot {snapshot_id} for '{metadata['name']}'.")
+    return snapshot_id
+
+
+def restore_snapshot_locked(path: Path, snapshot_id: str) -> None:
+    target = snapshot_root(path) / snapshot_id
+    snapshot_upper = target / "upper"
+    restore = path / f".restore-{uuid.uuid4().hex}"
+    backup = path / f".upper-before-restore-{uuid.uuid4().hex}"
+    copy_directory(snapshot_upper, restore, "Vforge snapshot upper directory")
+    current_upper = path / "upper"
+    try:
+        os.replace(current_upper, backup)
+        os.replace(restore, current_upper)
+    except OSError as error:
+        if backup.exists() and not current_upper.exists():
+            os.replace(backup, current_upper)
+        if restore.exists():
+            shutil.rmtree(restore, ignore_errors=True)
+        raise VforgeError(f"could not restore Vforge snapshot {snapshot_id}: {error}") from error
+    try:
+        shutil.rmtree(backup)
+    except OSError as error:
+        raise VforgeError(f"snapshot restored, but old upper cleanup failed at {backup}: {error}") from error
+
+
+def rollback_environment(path: Path, snapshot_id: str | None = None) -> str:
+    with environment_lock(path, exclusive=True):
+        metadata = environment_metadata(path)
+        verify_project_mount_approvals(metadata)
+        base_identity = ensure_environment_base(path, metadata)
+        records = snapshot_records_locked(path)
+        if snapshot_id is None:
+            compatible = [record for record in records if record["base_identity"] == base_identity]
+            if not compatible:
+                raise VforgeError("there is no snapshot compatible with the active Veyra base")
+            snapshot_id = compatible[0]["snapshot_id"]
+        snapshot = read_snapshot(path, snapshot_id)
+        if snapshot["base_identity"] != base_identity:
+            raise VforgeError("snapshot belongs to a different Veyra base; restore that system deployment first")
+        restore_snapshot_locked(path, snapshot_id)
+    print(f"Restored Vforge environment '{metadata['name']}' from snapshot {snapshot_id}.")
+    return snapshot_id
+
+
+def delete_snapshot(path: Path, snapshot_id: str) -> None:
+    with environment_lock(path, exclusive=True):
+        metadata = environment_metadata(path)
+        verify_project_mount_approvals(metadata)
+        snapshot = read_snapshot(path, snapshot_id)
+        target = snapshot_root(path) / snapshot["snapshot_id"]
+        snapshots = snapshot_root(path).resolve(strict=True)
+        resolved_target = target.resolve(strict=True)
+        if resolved_target == snapshots or not resolved_target.is_relative_to(snapshots):
+            raise VforgeError(f"refusing to delete a path outside the snapshots directory: {target}")
+        shutil.rmtree(target)
+    print(f"Deleted Vforge snapshot {snapshot_id}.")
+
+
+def upgrade_environment(path: Path) -> str:
+    with environment_lock(path, exclusive=True):
+        metadata = environment_metadata(path)
+        verify_project_mount_approvals(metadata)
+        current = current_base_identity(metadata)
+        recorded = validate_base_identity(metadata.get("base_identity"))
+        snapshot_base = recorded or current
+        snapshot_id = create_snapshot_locked(path, metadata, snapshot_base)
+        try:
+            status = namespace_command(
+                path,
+                ["vpkg", "upgrade"],
+                lock_held=True,
+                allow_base_mismatch=True,
+            )
+            if status:
+                raise VforgeError(f"vpkg exited with status {status}")
+        except (OSError, VforgeError) as error:
+            try:
+                restore_snapshot_locked(path, snapshot_id)
+            except VforgeError as restore_error:
+                raise VforgeError(
+                    f"Vforge upgrade failed ({error}) and snapshot {snapshot_id} could not be restored ({restore_error})"
+                ) from restore_error
+            raise VforgeError(
+                f"Vforge upgrade failed; the previous snapshot was restored and the old base binding was kept: {error}"
+            ) from error
+        metadata = environment_metadata(path)
+        metadata["base_identity"] = current
+        try:
+            write_metadata(path, metadata)
+        except VforgeError as error:
+            restore_snapshot_locked(path, snapshot_id)
+            raise VforgeError(
+                f"could not record the upgraded Veyra base; the previous snapshot was restored: {error}"
+            ) from error
+    print(f"Upgraded Vforge environment '{metadata['name']}' for Veyra {current['image_version']}; snapshot {snapshot_id} retained.")
+    return snapshot_id
 
 
 def ensure_vpkg_state(root: Path) -> None:
@@ -589,8 +1035,12 @@ def run_environment(path: Path, command: Sequence[str]) -> int:
         operation_error: BaseException | None = None
         try:
             run(["mount", "--make-rprivate", "/"])
-            mount_at(lower, ["mount", "--bind", "/", str(lower)])
-            run(["mount", "-o", "remount,bind,ro", str(lower)])
+            # Unprivileged mount namespaces require recursive bind mounts when
+            # the source tree contains submounts. Immediately detach those
+            # clones to keep host /etc, /var, /home, and other mounted state
+            # out of Vforge's lower layer.
+            mount_at(lower, ["mount", "--rbind", "/", str(lower)])
+            unmount_inherited_submounts(lower, mountpoints)
             options = f"lowerdir={lower},upperdir={metadata['upper']},workdir={metadata['work']}"
             mount_at(merged, ["mount", "-t", "overlay", "overlay", "-o", options, str(merged)])
             if metadata.get("project"):
@@ -675,12 +1125,30 @@ def list_environments() -> int:
     return 0
 
 
+def environment_target(name: str | None, cwd: Path) -> Path:
+    if name is not None:
+        return environment_path(name)
+    project = cwd.resolve()
+    project_name, _, _, _ = project_settings(project)
+    return environment_path(project_name, project=project)
+
+
+def package_command(action: str, packages: Sequence[str], cwd: Path, *, environment_name: str | None = None) -> int:
+    if action not in {"install", "remove", "search", "info"}:
+        raise VforgeError(f"unsupported Vforge package command: {action}")
+    if not packages:
+        raise VforgeError(f"`vforge {action}` requires at least one package name or search term")
+    path = environment_target(environment_name, cwd)
+    return namespace_command(path, ["vpkg", action, *packages])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vforge", description="Native Veyra environments using OverlayFS and Linux namespaces")
     subparsers = parser.add_subparsers(dest="action", required=True)
     create_parser = subparsers.add_parser("create", help="create a persistent OverlayFS environment")
     create_parser.add_argument("name")
     create_parser.add_argument("--storage-root", type=Path, help="select the persistent root for named environments")
+    create_parser.add_argument("--network", choices=("isolated", "shared"), default="isolated")
     for action in ("enter", "exec", "delete"):
         sub = subparsers.add_parser(action)
         sub.add_argument("name", nargs="?" if action == "enter" else None)
@@ -688,6 +1156,28 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("command", nargs=argparse.REMAINDER)
     subparsers.add_parser("list", help="list named environments")
     subparsers.add_parser("up", help="create or open the current project's environment")
+    package_help = {
+        "install": "install packages in a Vforge environment",
+        "remove": "remove packages from a Vforge environment",
+        "search": "search for packages from a Vforge environment",
+        "info": "show package details in a Vforge environment",
+    }
+    for action, help_text in package_help.items():
+        package = subparsers.add_parser(action, help=help_text)
+        package.add_argument("packages", nargs="+")
+        package.add_argument("--environment", help="target a named environment; defaults to the current project")
+    snapshot = subparsers.add_parser("snapshot", help="save the current environment state")
+    snapshot.add_argument("name", nargs="?", help="named environment; omit inside a project")
+    snapshots = subparsers.add_parser("snapshots", help="list saved environment snapshots")
+    snapshots.add_argument("name", nargs="?", help="named environment; omit inside a project")
+    rollback = subparsers.add_parser("rollback", help="restore a compatible environment snapshot")
+    rollback.add_argument("name", nargs="?", help="named environment; omit inside a project")
+    rollback.add_argument("--snapshot", dest="snapshot_id", help="specific snapshot ID; defaults to newest compatible")
+    delete_snapshot_parser = subparsers.add_parser("delete-snapshot", help="remove a saved environment snapshot")
+    delete_snapshot_parser.add_argument("name", nargs="?", help="named environment; omit inside a project")
+    delete_snapshot_parser.add_argument("--id", required=True, dest="snapshot_id")
+    upgrade = subparsers.add_parser("upgrade", help="update an environment for the active Veyra base")
+    upgrade.add_argument("name", nargs="?", help="named environment; omit inside a project")
     config = subparsers.add_parser("config", help="configure Vforge")
     config_sub = config.add_subparsers(dest="config_action", required=True)
     storage = config_sub.add_parser("storage-root", help="select persistent storage for named environments")
@@ -709,13 +1199,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 selected = selected.resolve()
                 ensure_private_directory(selected)
                 write_private_json(config_directory() / "config.json", {"storage_root": str(selected)}, "Vforge configuration")
-            create(args.name)
+            create(args.name, network=args.network)
             return 0
         if args.action == "up":
             project_up(Path.cwd())
             return 0
         if args.action == "list":
             return list_environments()
+        if args.action in {"install", "remove", "search", "info"}:
+            return package_command(args.action, args.packages, Path.cwd(), environment_name=args.environment)
+        if args.action in {"snapshot", "snapshots", "rollback", "delete-snapshot", "upgrade"}:
+            path = environment_target(args.name, Path.cwd())
+            if args.action == "snapshot":
+                snapshot_environment(path)
+            elif args.action == "snapshots":
+                records = list_snapshots(path)
+                print("ID\tVEYRA\tCREATED")
+                for record in records:
+                    base = record["base_identity"]
+                    print(f"{record['snapshot_id']}\t{base['image_version']}\t{record['created_at']}")
+            elif args.action == "rollback":
+                rollback_environment(path, args.snapshot_id)
+            elif args.action == "delete-snapshot":
+                delete_snapshot(path, args.snapshot_id)
+            else:
+                upgrade_environment(path)
+            return 0
         if args.action == "config":
             selected = args.path.expanduser()
             if not selected.is_absolute():
@@ -726,7 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(selected)
             return 0
         if args.action == "enter" and args.name is None:
-            path = project_up(Path.cwd())
+            path, _ = project_environment(Path.cwd())
             return namespace_command(path, [])
         if args.name is None:
             raise VforgeError("environment name is required")
@@ -736,8 +1245,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return namespace_command(path, command)
         if args.action == "delete":
             if path.exists():
-                environment_metadata(path)
-                shutil.rmtree(path)
+                with environment_lock(path, exclusive=True):
+                    environment_metadata(path)
+                    shutil.rmtree(path)
                 print(f"Deleted environment '{args.name}'")
             return 0
     except (OSError, VforgeError) as error:
