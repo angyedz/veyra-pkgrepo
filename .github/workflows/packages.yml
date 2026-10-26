@@ -84,8 +84,8 @@ jobs:
           test -s /usr/lib/sysupdate.d/99-uki.transfer
           test -x /usr/bin/vforge
           vforge --help > /tmp/veyra-vforge-help.txt
-          grep -Fq 'persistent Fedora 44 environment' /tmp/veyra-vforge-help.txt
-          for requirement in e2fsprogs fuse-overlayfs podman python3; do
+          grep -Fq 'Native Veyra environments using OverlayFS' /tmp/veyra-vforge-help.txt
+          for requirement in python3 util-linux; do
             rpm -q --requires veyra-vforge | grep -Fx "$requirement"
           done
           if rpm -q --requires veyra-vpkg | grep -Eq '^dnf5(-plugins)?([ <=>].*)?$'; then

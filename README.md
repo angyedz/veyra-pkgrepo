@@ -16,7 +16,7 @@ The repository contains only Veyra-maintained software. Source trees live in `so
 
 Versioned package releases are published as GitHub Releases from tags named `rpm-v<version>` (for example, `rpm-v0.1.0`). A testing prerelease uses the corresponding `rpm-v<version>-testing` tag. Each release contains signed RPM files, the Veyra public signing key, checksums, and a complete signed repository snapshot archive named `veyra-rpm-repo-x86_64.tar.gz`. `vpkg` consumes the signed release snapshot through libdnf5; the raw channel URLs below remain a development mirror.
 
-The repository includes the `veyra-vpkg`, `veyra-vforge`, and `veyra-update` source packages plus a small `veyra-release` CI package. The Vforge RPM packages a committed source snapshot and CI checks its installed CLI and declared runtime dependencies; Fedora 44 guest QEMU validation remains required before Vforge is treated as runtime-validated or released. CI also checks that vpkg does not require the DNF command-line client. This repository will not carry the complete Fedora system package set.
+The repository includes the `veyra-vpkg`, `veyra-vforge`, and `veyra-update` source packages plus a small `veyra-release` CI package. Vforge uses native OverlayFS and Linux namespaces over the read-only Veyra EROFS system root; its RPM has no Podman or separate Fedora-root dependency. CI checks the committed source, installed CLI, and runtime dependencies; Fedora 44 guest validation remains required before Vforge is treated as runtime-validated or released. CI also checks that vpkg does not require the DNF command-line client. This repository will not carry the complete Fedora system package set.
 
 ## Configure a package channel
 
