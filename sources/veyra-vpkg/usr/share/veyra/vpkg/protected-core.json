@@ -86,6 +86,7 @@
       "/usr/lib/firmware/",
       "/usr/lib/initcpio/",
       "/usr/lib/kernel/",
+      "/usr/lib/systemd/boot/",
       "/usr/lib/modules/",
       "/usr/lib/systemd/system-generators/",
       "/usr/lib/systemd/user-generators/",
@@ -95,6 +96,42 @@
       "/usr/lib64/vulkan/",
       "/usr/lib64/xorg/modules/drivers/",
       "/usr/share/vulkan/icd.d/"
+    ]
+  },
+  "system_payload_paths": {
+    "allowed_prefixes": [
+      "/usr/",
+      "/etc/"
+    ],
+    "denied_exact": [
+      "/usr/bin/init",
+      "/usr/lib/os-release",
+      "/usr/lib/systemd/systemd",
+      "/etc/group",
+      "/etc/gshadow",
+      "/etc/machine-id",
+      "/etc/passwd",
+      "/etc/shadow"
+    ],
+    "denied_prefixes": [
+      "/boot/",
+      "/efi/",
+      "/etc/dracut.conf.d/",
+      "/etc/kernel/",
+      "/etc/systemd/boot/",
+      "/usr/lib/dracut/",
+      "/usr/lib/firmware/",
+      "/usr/lib/initcpio/",
+      "/usr/lib/kernel/",
+      "/usr/lib/modules/",
+      "/usr/lib/systemd/boot/",
+      "/usr/lib/systemd/system-generators/",
+      "/usr/lib/systemd/user-generators/",
+      "/usr/lib/sysimage/",
+      "/usr/lib/tmpfiles.d/",
+      "/usr/lib/sysusers.d/",
+      "/usr/lib/veyra/",
+      "/usr/share/veyra/"
     ]
   }
 }

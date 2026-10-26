@@ -76,6 +76,8 @@ jobs:
           test -x /usr/bin/vpkg
           test -s /usr/lib/veyra/vpkg_libdnf.py
           test -s /usr/lib/veyra/veyra_repo.py
+          test -x /usr/libexec/veyra-vpkg-initrd.py
+          rpm -ql veyra-vpkg | grep -Fx /usr/libexec/veyra-vpkg-initrd.py
           test -s /usr/share/veyra/vpkg/protected-core.json
           rpm -ql veyra-vpkg | grep -Fx /usr/share/veyra/vpkg/protected-core.json
           rpm -qf /usr/share/veyra/vpkg/protected-core.json | grep -Eq '^veyra-vpkg-[0-9]'

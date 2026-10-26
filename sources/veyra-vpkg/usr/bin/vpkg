@@ -39,6 +39,11 @@ RPMFUSION_REPOS = (
 CHANNEL_FILE = Path("/etc/veyra/vpkg/channel")
 VPKG_PUBLIC_KEY = Path("/usr/share/veyra/RPM-GPG-KEY-VEYRA")
 LOCK_FILE = Path("/run/lock/veyra-vpkg.lock")
+CONTAINER_LOCK_FILE = Path("/run/lock/veyra-vpkg-container.lock")
+CONTAINER_ROOT_MARKER = Path("/run/veyra-vforge/root.json")
+CONTAINER_STATE_DIR = Path("/var/lib/veyra/vpkg/container")
+CONTAINER_CACHE_DIR = Path("/var/cache/veyra/vpkg/container")
+PROC_MOUNTINFO = Path("/proc/self/mountinfo")
 PACKAGE_EXTENSION_DIR = Path("/var/lib/extensions")
 SYSTEM_EXTENSION_LINK_DIR = Path("/etc/extensions")
 VPKG_ROOT = Path("/var/lib/veyra/vpkg/root")
@@ -46,8 +51,11 @@ USER_APP_STATE = Path("/var/lib/veyra/vpkg/apps")
 USER_APP_LAYER_DIR = Path("/var/lib/veyra/vpkg/app-layers")
 USER_APP_CURRENT = USER_APP_STATE / "current"
 VPKG_STATE_DIR = Path("/var/lib/veyra/vpkg")
+SYSTEM_GENERATION_DIR = VPKG_STATE_DIR / "system-generations"
 USER_APP_INTENTS = VPKG_STATE_DIR / "intents.json"
 STAGED_PACKAGE_FILE = VPKG_STATE_DIR / "staged-package.json"
+SYSTEM_TRIAL_FILE = VPKG_STATE_DIR / "system-trial.json"
+SYSTEM_GENERATION_HELPER = Path("/usr/libexec/veyra-vpkg-initrd.py")
 DEPLOYMENT_BINDING_DIR = VPKG_STATE_DIR / "deployments"
 PENDING_UPDATE_FILE = VPKG_STATE_DIR / "pending.json"
 USER_APP_SYSEXT_LINK = SYSTEM_EXTENSION_LINK_DIR / "vpkg-apps"
@@ -63,6 +71,7 @@ RPMFUSION_KEYS = (
 PACKAGE_RE = re.compile(r"^veyra-[A-Za-z0-9][A-Za-z0-9+_.-]*$")
 RPM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.-]*$")
 ROOTHASH_RE = re.compile(r"^[0-9a-f]{64}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RPM_EVR_RE = re.compile(
     r"^(?:0|[1-9][0-9]*):[A-Za-z0-9][A-Za-z0-9.+_~^]*-[A-Za-z0-9][A-Za-z0-9.+_~^]*$"
 )
@@ -84,11 +93,12 @@ def load_vpkg_policy() -> dict[str, object]:
         raise VpkgError("The protected-core policy is malformed or targets an unsupported base.")
     packages = policy.get("protected_packages")
     paths = policy.get("payload_paths")
-    if not isinstance(packages, dict) or not isinstance(paths, dict):
+    system_paths = policy.get("system_payload_paths")
+    if not isinstance(packages, dict) or not isinstance(paths, dict) or not isinstance(system_paths, dict):
         raise VpkgError("The protected-core policy is missing package or payload rules.")
     if set(packages) != {"names", "prefixes"} or set(paths) != {
         "allowed_prefixes", "denied_exact", "denied_prefixes"
-    }:
+    } or set(system_paths) != {"allowed_prefixes", "denied_exact", "denied_prefixes"}:
         raise VpkgError("The protected-core policy has unknown or missing rule sections.")
 
     def string_list(section: dict[str, object], key: str) -> list[str]:
@@ -104,10 +114,15 @@ def load_vpkg_policy() -> dict[str, object]:
     allowed = string_list(paths, "allowed_prefixes")
     denied_exact = string_list(paths, "denied_exact")
     denied_prefixes = string_list(paths, "denied_prefixes")
+    system_allowed = string_list(system_paths, "allowed_prefixes")
+    system_denied_exact = string_list(system_paths, "denied_exact")
+    system_denied_prefixes = string_list(system_paths, "denied_prefixes")
     if not names or not prefixes or not allowed:
         raise VpkgError("The protected-core policy must define protected packages and payload roots.")
     if any(prefix not in {"/usr/", "/opt/"} for prefix in allowed):
         raise VpkgError("The protected-core policy may only allow additive /usr and /opt payloads.")
+    if any(prefix not in {"/usr/", "/etc/"} for prefix in system_allowed):
+        raise VpkgError("The system-generation policy may only own /usr and /etc payloads.")
     if any(not RPM_NAME_RE.fullmatch(name) or name != name.lower() for name in names):
         raise VpkgError("The protected-core policy contains an invalid protected package name.")
     if any(
@@ -115,10 +130,10 @@ def load_vpkg_policy() -> dict[str, object]:
         for prefix in prefixes
     ):
         raise VpkgError("The protected-core policy contains an invalid package prefix.")
-    for path in denied_exact:
+    for path in denied_exact + system_denied_exact:
         if not path.startswith("/") or posixpath.normpath(path) != path or ".." in path.split("/"):
             raise VpkgError("The protected-core policy contains an invalid denied path.")
-    for path in allowed + denied_prefixes:
+    for path in allowed + denied_prefixes + system_allowed + system_denied_prefixes:
         if (
             not path.startswith("/")
             or not path.endswith("/")
@@ -126,7 +141,7 @@ def load_vpkg_policy() -> dict[str, object]:
             or ".." in path.split("/")
         ):
             raise VpkgError("The protected-core policy contains an invalid path prefix.")
-    if set(allowed) & set(denied_prefixes):
+    if set(allowed) & set(denied_prefixes) or set(system_allowed) & set(system_denied_prefixes):
         raise VpkgError("The protected-core policy has contradictory allowed and denied paths.")
     return policy
 
@@ -219,6 +234,151 @@ def fedora_release_from_root(root: Path | None = None) -> str:
             f"REJECT: vpkg is configured for Fedora {FEDORA_RELEASE}, but the selected base reports Fedora {version}."
         )
     return version
+
+
+def _mountinfo_mounts(mountinfo: str) -> dict[str, set[str]]:
+    """Return mountpoint -> per-mount options from Linux mountinfo."""
+    mounts: dict[str, set[str]] = {}
+    for line in mountinfo.splitlines():
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            raise VpkgError("Container mount information is malformed.")
+        mountpoint = fields[4]
+        for escaped, value in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+            mountpoint = mountpoint.replace(escaped, value)
+        mounts[mountpoint] = set(fields[5].split(","))
+    return mounts
+
+
+def _read_container_release_identity(root: Path) -> tuple[str, str, str, str]:
+    release_file = resolve_path_in_root(root, "/usr/lib/os-release")
+    try:
+        lines = release_file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise VpkgError("Cannot read the container Veyra deployment identity.") from error
+    wanted = {"ID", "VERSION_ID", "IMAGE_ID", "IMAGE_VERSION"}
+    fields: dict[str, str] = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        if key not in wanted:
+            continue
+        if key in fields:
+            raise VpkgError(f"Container os-release contains duplicate {key} fields.")
+        try:
+            values = shlex.split(raw, comments=True, posix=True)
+        except ValueError as error:
+            raise VpkgError(f"Container os-release has malformed {key} syntax.") from error
+        if len(values) != 1 or not values[0]:
+            raise VpkgError(f"Container os-release has an invalid {key} value.")
+        fields[key] = values[0]
+    if set(fields) != wanted:
+        raise VpkgError("Container root lacks a complete Veyra deployment identity.")
+    if fields["ID"] != "fedora" or fields["VERSION_ID"] != FEDORA_RELEASE:
+        raise VpkgReject("REJECT: vpkg requires a Fedora 44 Veyra rootfs.")
+    if fields["IMAGE_ID"] != "veyra-next" or not re.fullmatch(r"[A-Za-z0-9._+-]+", fields["IMAGE_VERSION"]):
+        raise VpkgReject("REJECT: rootfs is not a supported Veyra deployment.")
+    return fields["ID"], fields["VERSION_ID"], fields["IMAGE_ID"], fields["IMAGE_VERSION"]
+
+
+def validate_container_root(
+    root: Path = Path("/"),
+    marker_path: Path = CONTAINER_ROOT_MARKER,
+    mountinfo_path: Path = PROC_MOUNTINFO,
+    cmdline_path: Path = Path("/proc/cmdline"),
+) -> dict[str, object]:
+    """Fail closed unless running on a private Veyra OverlayFS root with private state."""
+    try:
+        mountinfo = mountinfo_path.read_text(encoding="utf-8")
+        marker_stat = marker_path.stat(follow_symlinks=False)
+        marker = read_json_object(marker_path, "Vforge Veyra root marker")
+    except (OSError, VpkgError) as error:
+        raise VpkgReject(f"REJECT: Veyra container root marker is unavailable: {error}") from error
+    mounts = _mountinfo_mounts(mountinfo)
+    marker_mount = mounts.get(str(marker_path))
+    if marker_mount is None or "ro" not in marker_mount:
+        raise VpkgReject("REJECT: Vforge root marker must be mounted read-only into the container.")
+    if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != 0 or marker_stat.st_mode & 0o222:
+        raise VpkgReject("REJECT: Vforge root marker must be a root-owned, read-only regular file.")
+    required_fields = {
+        "schema", "kind", "root_id", "image_id", "image_version", "base_digest",
+        "storage_driver", "immutable_base",
+    }
+    if not required_fields.issubset(marker) or set(marker) - required_fields:
+        raise VpkgReject("REJECT: Vforge root marker has unknown or missing fields.")
+    if (
+        marker.get("schema") != 1
+        or marker.get("kind") != "vforge-veyra-root"
+        or marker.get("image_id") != "veyra-next"
+        or marker.get("storage_driver") != "overlayfs"
+        or marker.get("immutable_base") is not True
+        or not isinstance(marker.get("root_id"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", marker["root_id"])
+        or not isinstance(marker.get("base_digest"), str)
+        or not SHA256_RE.fullmatch(marker["base_digest"])
+        or not isinstance(marker.get("image_version"), str)
+        or not re.fullmatch(r"[A-Za-z0-9._+-]+", marker["image_version"])
+    ):
+        raise VpkgReject("REJECT: Vforge root marker does not identify a private Veyra OverlayFS deployment.")
+    try:
+        command_line = cmdline_path.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise VpkgReject(f"REJECT: active Veyra dm-verity identity is unavailable: {error}") from error
+    active_roothashes = re.findall(r"(?:^|\s)roothash=([0-9a-f]{64})(?:\s|$)", command_line)
+    if len(active_roothashes) != 1 or marker["base_digest"] != active_roothashes[0]:
+        raise VpkgReject("REJECT: Vforge marker does not match the active dm-verity root hash.")
+    _, _, image_id, image_version = _read_container_release_identity(root)
+    if marker["image_id"] != image_id or marker["image_version"] != image_version:
+        raise VpkgReject("REJECT: Vforge marker identity does not match the mounted Veyra rootfs.")
+    if any(path == "/usr" or path.startswith("/usr/") for path in mounts):
+        raise VpkgReject("REJECT: container /usr and RPM database must come from the private Veyra OverlayFS rootfs.")
+    database = rpm_database_path(root)
+    expected_db = root / "usr/lib/sysimage/rpm"
+    if database != Path("/usr/lib/sysimage/rpm") or any(
+        path == "/usr/lib/sysimage/rpm" or path.startswith("/usr/lib/sysimage/rpm/")
+        for path in mounts
+    ):
+        raise VpkgReject("REJECT: container RPM database must be private at /usr/lib/sysimage/rpm.")
+    if not expected_db.is_dir():
+        raise VpkgReject("REJECT: private container RPM database directory is missing.")
+    private_dirs = (
+        expected_db,
+        CONTAINER_STATE_DIR,
+        CONTAINER_STATE_DIR / "history",
+        CONTAINER_STATE_DIR / "persist",
+        CONTAINER_STATE_DIR / "state",
+        CONTAINER_STATE_DIR / "log",
+        CONTAINER_CACHE_DIR,
+    )
+    for directory in private_dirs:
+        if directory.resolve(strict=False) != directory:
+            raise VpkgReject(f"REJECT: private Veyra package path resolves outside its root: {directory}")
+    for directory in (CONTAINER_STATE_DIR, CONTAINER_CACHE_DIR):
+        if directory == Path("/") or not str(directory).startswith("/var/"):
+            raise VpkgError("Internal error: container Vpkg state path is not private under /var.")
+        if any(
+            mountpoint != "/"
+            and (mountpoint == "/var"
+            or str(directory) == mountpoint
+            or str(directory).startswith(mountpoint.rstrip("/") + "/")
+            or mountpoint.startswith(str(directory).rstrip("/") + "/"))
+            for mountpoint in mounts
+        ):
+            raise VpkgReject("REJECT: container Vpkg state and cache must remain in the private Veyra rootfs overlay.")
+    return marker
+
+
+def is_vforge_environment(marker_path: Path = CONTAINER_ROOT_MARKER) -> bool:
+    """Detect the Vforge root marker without following symlinks."""
+    try:
+        marker_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise VpkgReject(f"REJECT: cannot inspect the Vforge root marker: {error}") from error
+    return True
 
 
 def run(
@@ -318,6 +478,91 @@ def validate_user_package_paths(paths: list[str]) -> None:
             )
 
 
+def validate_system_package_paths(paths: list[str]) -> None:
+    """Restrict native generation RPM payloads to generation-owned /usr and /etc."""
+    policy = load_vpkg_policy()["system_payload_paths"]
+    assert isinstance(policy, dict)
+    allowed_prefixes = policy["allowed_prefixes"]
+    denied_exact = policy["denied_exact"]
+    denied_prefixes = policy["denied_prefixes"]
+    for path in paths:
+        normalized = posixpath.normpath(path)
+        if (
+            not path.startswith("/")
+            or normalized != path.rstrip("/")
+            or ".." in path.split("/")
+            or "\x00" in path
+        ):
+            raise VpkgReject(f"REJECT: system RPM has an unsafe payload path: {path!r}")
+        if path in {"/usr", "/etc"}:
+            continue
+        if path in denied_exact or any(path.startswith(prefix) for prefix in denied_prefixes):
+            raise VpkgReject(f"REJECT: system RPM payload changes a protected system path: {path}")
+        if not any(path.startswith(prefix) for prefix in allowed_prefixes):
+            raise VpkgReject(
+                f"REJECT: system RPM payload is outside generation-owned /usr or /etc: {path}"
+            )
+
+
+def rpm_file_has_execution_hooks(package_path: Path) -> bool:
+    """Inspect a downloaded RPM itself, including packages removed by the transaction."""
+    if package_path.is_symlink() or not package_path.is_file():
+        raise VpkgError(f"The libdnf5 transaction package path is unavailable: {package_path}")
+    for option in ("--scripts", "--triggers", "--filetriggers"):
+        if run(["rpm", "-qp", option, str(package_path)], capture=True).stdout.strip():
+            return True
+    transfiletriggers = run(
+        ["rpm", "-qp", "--qf", "%|TRANSFILETRIGGERSCRIPTS?{present}:{absent}|", str(package_path)],
+        capture=True,
+    ).stdout.strip()
+    if transfiletriggers != "absent":
+        return True
+    sysusers = run(
+        ["rpm", "-qp", "--qf", "[%{SYSUSERS}\\n]", str(package_path)],
+        capture=True,
+    ).stdout.strip()
+    return bool(sysusers and sysusers != "(none)")
+
+
+def validate_system_rpm_file(package_path: Path) -> None:
+    if rpm_file_has_execution_hooks(package_path):
+        raise VpkgReject(
+            f"REJECT: package {package_path.name} declares scriptlets, triggers, or SYSUSERS actions; "
+            "the system-generation backend will not execute them."
+        )
+    output = run(
+        [
+            "rpm", "-qp", "--qf",
+            "[%{FILENAMES}\\t%{FILEMODES}\\t%{FILELINKTOS}\\t%{FILECAPS}\\n]",
+            str(package_path),
+        ],
+        capture=True,
+    ).stdout
+    for entry in output.splitlines():
+        fields = entry.split("\t")
+        if len(fields) != 4 or not fields[0]:
+            raise VpkgError(f"Could not inspect the signed system RPM payload: {package_path}")
+        path, raw_mode, link_target, capabilities = fields
+        try:
+            mode = int(raw_mode, 10)
+        except ValueError as error:
+            raise VpkgError(f"Could not parse the system RPM file mode for {path}.") from error
+        validate_system_package_paths([path])
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            raise VpkgReject(f"REJECT: system RPM contains a special file: {path}")
+        if mode & (stat.S_ISUID | stat.S_ISGID) or capabilities not in {"", "(none)"}:
+            raise VpkgReject(f"REJECT: system RPM contains a privileged payload file: {path}")
+        if stat.S_ISLNK(mode):
+            if not link_target or link_target == "(none)":
+                raise VpkgError(f"Could not inspect the system RPM symlink target: {path}")
+            target = (
+                posixpath.normpath(link_target)
+                if link_target.startswith("/")
+                else posixpath.normpath(posixpath.join(posixpath.dirname(path), link_target))
+            )
+            validate_system_package_paths([target])
+
+
 def repo_id(channel: str | None = None) -> str:
     return CHANNELS[channel or selected_channel()]
 
@@ -381,6 +626,56 @@ def package_session(
         raise VpkgError(str(error)) from error
     except Exception as error:
         raise VpkgError(f"Could not initialize the libdnf5 package session: {error}") from error
+
+
+def container_package_session(refresh: bool = False) -> Session:
+    """Create a libdnf session whose installroot and all mutable state are this Veyra root."""
+    try:
+        return Session(
+            installroot=Path("/"),
+            releasever=FEDORA_RELEASE,
+            repo_ids=selected_repo_ids(None, include_rpmfusion=True, include_upstream=True, include_veyra=False),
+            cache_dir=CONTAINER_CACHE_DIR,
+            history_dir=CONTAINER_STATE_DIR / "history",
+            persist_dir=CONTAINER_STATE_DIR / "persist",
+            state_dir=CONTAINER_STATE_DIR / "state",
+            log_dir=CONTAINER_STATE_DIR / "log",
+            no_scripts=False,
+            refresh=refresh,
+        )
+    except LibdnfError as error:
+        raise VpkgError(str(error)) from error
+    except Exception as error:
+        raise VpkgError(f"Could not initialize the private container libdnf5 session: {error}") from error
+
+
+def container_protected_packages() -> tuple[set[str], tuple[str, ...]]:
+    """Read only the stable protected-package policy, independent of generation policy sections."""
+    policy = read_json_object(VPKG_POLICY_FILE, "protected-core policy")
+    packages = policy.get("protected_packages")
+    if policy.get("schema") != 1 or not isinstance(packages, dict):
+        raise VpkgError("The protected-core policy is malformed.")
+    names = packages.get("names")
+    prefixes = packages.get("prefixes")
+    if (
+        not isinstance(names, list)
+        or not names
+        or not all(isinstance(name, str) and RPM_NAME_RE.fullmatch(name) for name in names)
+        or not isinstance(prefixes, list)
+        or not all(isinstance(prefix, str) and re.fullmatch(r"[a-z0-9][a-z0-9+_.-]*", prefix) for prefix in prefixes)
+    ):
+        raise VpkgError("The protected-core package policy is malformed.")
+    return set(names), tuple(prefixes)
+
+
+def validate_container_changes(changes) -> None:
+    protected_names, protected_prefixes = container_protected_packages()
+    changed = sorted({item.name for item in changes if item.name in protected_names or item.name.startswith(protected_prefixes)})
+    if changed:
+        raise VpkgReject(
+            "REJECT: container transaction would change protected Veyra base packages: "
+            + ", ".join(changed)
+        )
 
 
 def rpm_records(root: Path | None = None) -> dict[str, set[str]]:
@@ -528,10 +823,18 @@ def verify_user_app_generation(generation: Path) -> dict[str, object]:
         actual = user_app_tree_digest(generation / "tree")
         if actual != integrity["tree_sha256"]:
             raise VpkgError("The app-layer generation payload failed its SHA-256 integrity check.")
+        # Production generations have a fixed root-owned state path. Tests and
+        # explicit temporary installroots may use an alternate path that the
+        # unprivileged test process owns; keep the immutable-mode check there,
+        # while preserving the root-owner invariant for the real state tree.
+        require_root_owner = USER_APP_LAYER_DIR == Path("/var/lib/veyra/vpkg/app-layers")
         entries = [generation, *generation.rglob("*")]
         for path in entries:
             metadata = path.lstat()
-            if metadata.st_uid != 0 or (not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o222):
+            if (
+                (require_root_owner and metadata.st_uid != 0)
+                or (not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o222)
+            ):
                 raise VpkgError("The app-layer generation content is not root-owned and sealed read-only.")
     validate_user_app_requests(manifest.get("requests"))
     installed = manifest.get("installed")
@@ -674,7 +977,7 @@ def read_json_object(path: Path, description: str) -> dict[str, object]:
     return value
 
 
-def atomic_write_json(path: Path, value: dict[str, object]) -> None:
+def atomic_write_json(path: Path, value: dict[str, object], *, mode: int = 0o644) -> None:
     temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
         path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -685,7 +988,7 @@ def atomic_write_json(path: Path, value: dict[str, object]) -> None:
             json.dump(value, stream, sort_keys=True, indent=2)
             stream.write("\n")
             stream.flush()
-            os.fchmod(stream.fileno(), 0o644)
+            os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -912,6 +1215,366 @@ def load_staged_package_trial() -> dict[str, object] | None:
     }
 
 
+def load_system_generation_trial() -> dict[str, object] | None:
+    if not SYSTEM_TRIAL_FILE.exists() and not SYSTEM_TRIAL_FILE.is_symlink():
+        return None
+    marker = read_json_object(SYSTEM_TRIAL_FILE, "system-generation trial marker")
+    roothash = marker.get("roothash")
+    version = marker.get("version")
+    generation_id = marker.get("generation_id")
+    parent_id = marker.get("parent_generation")
+    origin_boot_id = marker.get("origin_boot_id")
+    attempts = marker.get("attempts")
+    state = marker.get("state")
+    try:
+        valid_boot_id = isinstance(origin_boot_id, str) and str(uuid.UUID(origin_boot_id)) == origin_boot_id
+    except ValueError:
+        valid_boot_id = False
+    if (
+        marker.get("schema") != 1
+        or marker.get("kind") != "system-generation"
+        or not isinstance(roothash, str)
+        or not ROOTHASH_RE.fullmatch(roothash)
+        or not isinstance(version, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version)
+        or not isinstance(generation_id, str)
+        or not re.fullmatch(r"generation-[0-9a-f]{32}", generation_id)
+        or not isinstance(parent_id, str)
+        or not re.fullmatch(r"generation-[0-9a-f]{32}", parent_id)
+        or not valid_boot_id
+        or type(attempts) is not int
+        or attempts not in {0, 1}
+        or state not in {"pending", "committing", "failed"}
+    ):
+        raise VpkgError("The system-generation trial marker is malformed; refusing package changes.")
+    if SYSTEM_TRIAL_FILE.stat().st_mode & 0o077 or SYSTEM_TRIAL_FILE.stat().st_uid != 0:
+        raise VpkgError("The system-generation trial marker is not private root-owned state.")
+    return marker
+
+
+def write_system_generation_trial(marker: dict[str, object]) -> None:
+    if SYSTEM_TRIAL_FILE.exists() or SYSTEM_TRIAL_FILE.is_symlink():
+        raise VpkgError("Another system-generation trial is already pending or needs recovery.")
+    atomic_write_json(SYSTEM_TRIAL_FILE, marker, mode=0o600)
+
+
+def active_system_generation(roothash: str, version: str) -> Path:
+    identity_dir = SYSTEM_GENERATION_DIR / f"{roothash}--{version}"
+    active = identity_dir / "active"
+    if not active.is_symlink():
+        raise VpkgError("The running deployment has no active native system generation.")
+    generation_id = os.readlink(active)
+    if not re.fullmatch(r"generation-[0-9a-f]{32}", generation_id):
+        raise VpkgError("The active system-generation selector is malformed.")
+    generation = identity_dir / generation_id
+    if generation.is_symlink() or not generation.is_dir():
+        raise VpkgError("The active system generation is unavailable.")
+    manifest = read_json_object(generation / "manifest.json", "system-generation manifest")
+    if (
+        manifest.get("schema") != 1
+        or manifest.get("generation_id") != generation_id
+        or manifest.get("base_roothash") != roothash
+        or manifest.get("uki_image_version") != version
+    ):
+        raise VpkgError("The active system generation belongs to a different deployment identity.")
+    return generation
+
+
+def mount_system_transaction_root(
+    generation: Path,
+    parent_usr_layers: tuple[Path, ...] = (),
+    parent_etc_layers: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    transaction_root = generation / ".transaction-root"
+    transaction_root.mkdir(mode=0o700)
+    mounted: list[Path] = []
+    try:
+        for name, parent_layers in (("usr", parent_usr_layers), ("etc", parent_etc_layers)):
+            target = transaction_root / name
+            target.mkdir(mode=0o700)
+            upper = generation / f"upper/{name}"
+            work = generation / f".transaction-work/{name}"
+            work.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lower = Path("/") / name
+            if not lower.is_dir() or upper.is_symlink() or work.is_symlink():
+                raise VpkgError(f"The staged system generation has an unsafe /{name} mount layer.")
+            if upper.stat().st_dev != work.stat().st_dev:
+                raise VpkgError(f"The staged /{name} upper and work directories must share a filesystem.")
+            if any(
+                parent.is_symlink() or not parent.is_dir() or parent.stat().st_dev != upper.stat().st_dev
+                for parent in parent_layers
+            ):
+                raise VpkgError(f"The staged /{name} parent generation layers are unavailable or unsafe.")
+            lower_dirs = [str(parent) for parent in parent_layers] + [str(lower)]
+            run([
+                "mount", "-t", "overlay", "overlay", "-o",
+                f"lowerdir={':'.join(lower_dirs)},upperdir={upper},workdir={work},"
+                "index=off,metacopy=off,redirect_dir=off",
+                str(target),
+            ])
+            mounted.append(target)
+        return tuple(mounted)
+    except (OSError, VpkgError) as error:
+        for mountpoint in reversed(mounted):
+            try:
+                run(["umount", str(mountpoint)])
+            except VpkgError:
+                pass
+        raise VpkgError(f"Could not mount the staged system package root: {error}") from error
+
+
+def unmount_system_transaction_root(mounts: tuple[Path, ...] | list[Path]) -> None:
+    failures: list[str] = []
+    for mountpoint in reversed(mounts):
+        try:
+            run(["umount", str(mountpoint)])
+        except VpkgError as error:
+            failures.append(f"{mountpoint}: {error}")
+    if failures:
+        raise VpkgError("Could not unmount the staged system package root: " + "; ".join(failures))
+
+
+def system_rpmdb_digest(rpmdb: Path) -> str:
+    digest = hashlib.sha256()
+    if rpmdb.is_symlink() or not rpmdb.is_dir():
+        raise VpkgError("The staged system generation has no real RPM database directory.")
+    for path in sorted(rpmdb.rglob("*")):
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise VpkgError(f"The staged system RPM database contains an unsupported entry: {path}")
+        digest.update(path.relative_to(rpmdb).as_posix().encode("utf-8") + b"\0")
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def stage_system_generation(action: str, specifications: list[str]) -> None:
+    require_root()
+    if action not in {"install", "remove", "upgrade"}:
+        raise VpkgError("Unsupported system-generation action.")
+    if action != "upgrade" and not specifications:
+        raise VpkgError(f"Specify at least one package to {action} in the system generation.")
+    if action == "upgrade" and specifications:
+        raise VpkgError("The system-generation upgrade action does not accept package names.")
+    names = []
+    for name in specifications:
+        validate_user_package_name(name)
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise VpkgError("A system-generation transaction cannot repeat package names.")
+
+    def transaction() -> None:
+        require_no_pending_update()
+        roothash = running_deployment_roothash()
+        version = running_uki_version()
+        parent = active_system_generation(roothash, version)
+        parent_manifest = read_json_object(parent / "manifest.json", "active system-generation manifest")
+        previous_requests = parent_manifest.get("requests", [])
+        if not isinstance(previous_requests, list) or any(not isinstance(item, str) for item in previous_requests):
+            raise VpkgError("The active system generation has malformed package requests.")
+        requests = list(previous_requests)
+        if action == "install":
+            requests = list(dict.fromkeys([*requests, *names]))
+        elif action == "remove":
+            missing = [name for name in names if name not in requests]
+            if missing:
+                raise VpkgError("Only packages explicitly installed into a system generation can be removed: " + ", ".join(missing))
+            requests = [name for name in requests if name not in set(names)]
+
+        helper = SYSTEM_GENERATION_HELPER
+        if not helper.is_file() or helper.is_symlink():
+            raise VpkgError(f"The native system-generation helper is not installed: {helper}")
+        created = run(
+            [sys.executable, str(helper), "--sysroot", "/", "--prepare-trial",
+             "--roothash", roothash, "--image-version", version],
+            capture=True,
+        ).stdout.strip()
+        generation = Path(created)
+        identity_dir = SYSTEM_GENERATION_DIR / f"{roothash}--{version}"
+        try:
+            resolved = generation.resolve(strict=True)
+            if resolved.parent != identity_dir.resolve(strict=True) or not re.fullmatch(
+                r"generation-[0-9a-f]{32}", resolved.name
+            ):
+                raise VpkgError("The native helper returned a generation outside the active identity directory.")
+        except OSError as error:
+            raise VpkgError("The native helper returned an unavailable system generation.") from error
+
+        mounts: tuple[Path, ...] = ()
+        try:
+            layer_output = run([
+                sys.executable, str(helper), "--sysroot", "/", "--print-parent-layers",
+                "--roothash", roothash, "--image-version", version,
+                "--generation-id", generation.name,
+            ], capture=True).stdout
+            try:
+                layer_data = json.loads(layer_output)
+                if (
+                    not isinstance(layer_data, dict)
+                    or set(layer_data) != {"usr", "etc"}
+                    or any(not isinstance(layer_data[key], list) for key in ("usr", "etc"))
+                    or any(not isinstance(path, str) for key in ("usr", "etc") for path in layer_data[key])
+                ):
+                    raise ValueError("invalid parent layer response")
+                parent_usr_layers = tuple(Path(path) for path in layer_data["usr"])
+                parent_etc_layers = tuple(Path(path) for path in layer_data["etc"])
+                if any(path.parent != identity_dir or not re.fullmatch(r"generation-[0-9a-f]{32}", path.name)
+                       for path in (*parent_usr_layers, *parent_etc_layers)):
+                    raise ValueError("parent layer escaped the active deployment identity")
+            except (json.JSONDecodeError, ValueError) as error:
+                raise VpkgError(f"The generation helper returned invalid parent layers: {error}") from error
+            mounts = mount_system_transaction_root(generation, parent_usr_layers, parent_etc_layers)
+            base_records = rpm_records()
+            include_args = dict(
+                base_root=generation / ".transaction-root",
+                include_rpmfusion=False,
+                include_upstream=True,
+                include_veyra=False,
+                refresh=True,
+            )
+            try:
+                result = package_session(
+                    generation / ".transaction-root", "both", **include_args
+                ).resolve(action, names)
+            except LibdnfError as error:
+                raise VpkgReject(f"REJECT: Fedora 44 could not resolve the system transaction: {error}") from error
+            if not result.changes:
+                raise VpkgReject("REJECT: the Fedora system transaction made no package changes.")
+            for change in result.changes:
+                validate_system_rpm_file(Path(change.path))
+            installed = rpm_records(generation / ".transaction-root")
+            changed = sorted(
+                name for name in set(base_records) | set(installed)
+                if name != "gpg-pubkey" and base_records.get(name, set()) != installed.get(name, set())
+            )
+            policy = load_vpkg_policy()["protected_packages"]
+            assert isinstance(policy, dict)
+            protected_names = set(policy["names"])
+            protected_prefixes = tuple(policy["prefixes"])
+            protected = [name for name in changed if name in protected_names or name.startswith(protected_prefixes)]
+            if protected:
+                raise VpkgReject(
+                    "REJECT: transaction changes protected core package(s): " + ", ".join(protected)
+                )
+            if not changed:
+                raise VpkgReject("REJECT: the RPM solver reported changes but the candidate RPM database did not change.")
+            # libdnf5 has completed against the disposable overlay.  Unmount it
+            # before sealing metadata or publishing the trial marker so that a
+            # failed unmount can never leave a bootable half-finished trial.
+            unmount_system_transaction_root(mounts)
+            mounts = ()
+            run([
+                sys.executable, str(helper), "--sysroot", "/", "--seal-trial",
+                "--roothash", roothash, "--image-version", version,
+                "--generation-id", generation.name,
+            ])
+            candidate_packages = {
+                name: sorted(installed.get(name, set())) for name in requests
+            }
+            manifest = read_json_object(generation / "manifest.json", "candidate system-generation manifest")
+            manifest["state"] = "trial"
+            manifest["requests"] = requests
+            manifest["installed"] = candidate_packages
+            manifest["changed_packages"] = changed
+            atomic_write_json(generation / "manifest.json", manifest, mode=0o600)
+            boot_id = running_boot_id()
+            write_system_generation_trial({
+                "schema": 1,
+                "kind": "system-generation",
+                "roothash": roothash,
+                "version": version,
+                "generation_id": generation.name,
+                "parent_generation": parent.name,
+                "origin_boot_id": boot_id,
+                "attempts": 0,
+                "state": "pending",
+            })
+            print(
+                f"STAGED transaction: created system generation {generation.name}; reboot to validate or roll back."
+            )
+        except (VpkgError, OSError) as error:
+            if mounts:
+                try:
+                    unmount_system_transaction_root(mounts)
+                except VpkgError as cleanup_error:
+                    raise VpkgError(f"{error}; cleanup also failed: {cleanup_error}") from cleanup_error
+            if generation.exists() and not generation.is_symlink():
+                shutil.rmtree(generation, ignore_errors=True)
+            raise
+
+    with_lock(transaction)
+
+
+def complete_system_generation_trial() -> None:
+    require_root()
+
+    def complete() -> None:
+        if load_pending_update() is not None:
+            raise VpkgError("Cannot confirm a system generation while an OTA deployment is pending.")
+        trial = load_system_generation_trial()
+        if trial is None:
+            print("No vpkg system-generation trial is pending.")
+            return
+        if trial["state"] == "failed":
+            print("The failed vpkg system generation was rolled back during boot; use 'vpkg system rollback' to clear its marker.")
+            return
+        helper = SYSTEM_GENERATION_HELPER
+        if not helper.is_file() or helper.is_symlink():
+            raise VpkgError(f"The native system-generation helper is not installed: {helper}")
+        roothash = running_deployment_roothash()
+        version = running_uki_version()
+        run([
+            sys.executable, str(helper), "--sysroot", "/", "--complete-system-trial",
+            "--roothash", roothash, "--image-version", version,
+        ])
+        print("The booted vpkg system generation passed health checks and is now active.")
+
+    with_lock(complete)
+
+
+def rollback_system_generation() -> None:
+    require_root()
+
+    def rollback() -> None:
+        if load_pending_update() is not None:
+            raise VpkgError("System-generation rollback is blocked while an OTA deployment is pending.")
+        roothash = running_deployment_roothash()
+        version = running_uki_version()
+        helper = SYSTEM_GENERATION_HELPER
+        if not helper.is_file() or helper.is_symlink():
+            raise VpkgError(f"The native system-generation helper is not installed: {helper}")
+        marker = load_system_generation_trial()
+        if marker is not None:
+            if marker["roothash"] != roothash or marker["version"] != version:
+                raise VpkgError("The system-generation trial belongs to another deployment; recover it first.")
+            if marker["state"] == "failed":
+                run([
+                    sys.executable, str(helper), "--sysroot", "/", "--discard-failed-trial",
+                    "--roothash", roothash, "--image-version", version,
+                ])
+                print("Discarded the failed system-generation trial; the previous generation remains active.")
+                return
+            if marker["attempts"] == 0 and marker["origin_boot_id"] == running_boot_id():
+                run([
+                    sys.executable, str(helper), "--sysroot", "/", "--cancel-unbooted-trial",
+                    "--roothash", roothash, "--image-version", version,
+                ])
+                print("Cancelled the unbooted system-generation trial.")
+                return
+            marker["state"] = "failed"
+            atomic_write_json(SYSTEM_TRIAL_FILE, marker, mode=0o600)
+            print("Marked the booted system-generation trial for fallback; reboot to restore the prior generation.")
+            return
+        run([
+            sys.executable, str(helper), "--sysroot", "/", "--rollback-system-generation",
+            "--roothash", roothash, "--image-version", version,
+        ])
+        print("Selected the parent system generation; reboot to activate it.")
+
+    with_lock(rollback)
+
+
 def write_staged_package_trial(
     generation: Path,
     requests: list[dict[str, str]],
@@ -987,6 +1650,8 @@ def require_no_pending_update() -> None:
         )
     if load_staged_package_trial() is not None:
         raise VpkgError("Package changes are blocked while a staged vpkg generation awaits reboot validation or rollback.")
+    if load_system_generation_trial() is not None:
+        raise VpkgError("Package changes are blocked while a system-generation trial awaits validation or cleanup.")
 
 
 def require_no_ota_pending() -> None:
@@ -995,6 +1660,8 @@ def require_no_ota_pending() -> None:
         raise VpkgError(
             f"Package changes are blocked while OTA {pending['version']} is pending."
         )
+    if load_system_generation_trial() is not None:
+        raise VpkgError("A system-generation trial must be committed or recovered before another package change.")
 
 
 def current_user_app_requests() -> list[dict[str, str]]:
@@ -2434,6 +3101,49 @@ def with_lock(action) -> None:
         action()
 
 
+def with_container_lock(action) -> None:
+    CONTAINER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with CONTAINER_LOCK_FILE.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        action()
+
+
+def vforge_package_transaction(action: str, packages: list[str] | None = None) -> None:
+    """Apply a regular vpkg action to the active Vforge environment."""
+    require_root()
+    validate_container_root()
+    if action in {"install", "remove"}:
+        if not packages:
+            raise VpkgError(f"vpkg {action} requires at least one package specification.")
+        if any(not isinstance(spec, str) or not spec or spec.startswith("-") or "/" in spec or "\x00" in spec for spec in packages):
+            raise VpkgError("Vforge package specifications must be package names or NEVRAs.")
+        if any(spec.startswith("veyra-") for spec in packages):
+            raise VpkgError("Veyra system-extension packages cannot be installed in a Vforge environment.")
+    elif action != "upgrade":
+        raise VpkgError(f"Unsupported Vforge package action: {action}")
+
+    def transaction() -> None:
+        # Recheck under the private lock immediately before opening libdnf.
+        validate_container_root()
+        for directory in (CONTAINER_STATE_DIR, CONTAINER_CACHE_DIR):
+            directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+        session = container_package_session(refresh=True)
+        try:
+            result = session.resolve(
+                action,
+                packages or (),
+                validate_changes=validate_container_changes,
+            )
+        except LibdnfError as error:
+            raise VpkgError(str(error)) from error
+        if not result.changes:
+            print("Vforge packages are already up to date." if action == "upgrade" else "No Vforge package changes.")
+            return
+        print(f"Applied {len(result.changes)} package change(s) to the Vforge environment.")
+
+    with_container_lock(transaction)
+
+
 def set_channel(channel: str) -> None:
     require_root()
 
@@ -2548,6 +3258,8 @@ def prepare_for_base(base_root: Path, roothash: str, output: Path) -> dict[str, 
         raise VpkgError("Cannot prepare another OTA candidate while a deployment is pending.")
     if load_staged_package_trial() is not None:
         raise VpkgError("Cannot prepare an OTA candidate while a vpkg generation is staged for reboot.")
+    if load_system_generation_trial() is not None:
+        raise VpkgError("Cannot prepare an OTA candidate while a system-generation trial is pending or needs cleanup.")
     requests = load_user_app_intents()
     if not requests:
         return {
@@ -2656,10 +3368,14 @@ def package_query(channel: str | None = None, *, available: bool = True):
     return session, query
 
 
-def show_repositories() -> None:
-    session, _ = package_query("both")
+def show_repositories(*, vforge: bool = False) -> None:
+    if vforge:
+        session = container_package_session()
+        selected = set(selected_repo_ids(None, include_rpmfusion=True, include_upstream=True, include_veyra=False))
+    else:
+        session, _ = package_query("both")
+        selected = set(selected_repo_ids("both", include_rpmfusion=False))
     query = session.libdnf5.repo.RepoQuery(session.base)
-    selected = set(selected_repo_ids("both", include_rpmfusion=False))
     print("ID\tENABLED\tSELECTED\tNAME")
     for repo in sorted(query.list(), key=lambda item: item.get_id()):
         print(
@@ -2667,8 +3383,13 @@ def show_repositories() -> None:
         )
 
 
-def show_search(terms: list[str]) -> None:
-    session, query = package_query()
+def show_search(terms: list[str], *, vforge: bool = False) -> None:
+    if vforge:
+        session = container_package_session()
+        query = session.libdnf5.rpm.PackageQuery(session.base)
+        query.filter_available()
+    else:
+        session, query = package_query()
     query.filter_name(terms, session.libdnf5.common.QueryCmp_ICONTAINS)
     packages = sorted(query.to_sorted_vector(), key=lambda package: (package.get_name(), package.get_evr()))
     if not packages:
@@ -2678,8 +3399,13 @@ def show_search(terms: list[str]) -> None:
         print(f"{package.get_name()}\t{package.get_evr()}\t{package.get_repo_id()}\t{package.get_summary()}")
 
 
-def show_package_info(names: list[str]) -> None:
-    session, query = package_query()
+def show_package_info(names: list[str], *, vforge: bool = False) -> None:
+    if vforge:
+        session = container_package_session()
+        query = session.libdnf5.rpm.PackageQuery(session.base)
+        query.filter_available()
+    else:
+        session, query = package_query()
     query.filter_name(names)
     packages = sorted(query.to_sorted_vector(), key=lambda package: (package.get_name(), package.get_evr()))
     if not packages:
@@ -2695,7 +3421,22 @@ def show_package_info(names: list[str]) -> None:
         )
 
 
-def show_package_list(available: bool) -> None:
+def show_package_list(available: bool, *, vforge: bool = False) -> None:
+    if vforge:
+        if available:
+            session = container_package_session()
+            query = session.libdnf5.rpm.PackageQuery(session.base)
+            query.filter_available()
+            packages = sorted(query.to_sorted_vector(), key=lambda package: (package.get_name(), package.get_evr()))
+            print("NAME\tEVR\tARCH\tREPOSITORY")
+            for package in packages:
+                print(f"{package.get_name()}\t{package.get_evr()}\t{package.get_arch()}\t{package.get_repo_id()}")
+        else:
+            print("NAME\tNEVRA\tARCH")
+            output = run(["rpm", "-qa", "--qf", "%{NAME}\\t%{NEVRA}\\t%{ARCH}\\n"], capture=True).stdout
+            for line in sorted(output.splitlines()):
+                print(line)
+        return
     session, query = package_query("both" if not available else None, available=available)
     if not available:
         query.filter_from_repo_id(list(CHANNELS.values()))
@@ -2742,6 +3483,15 @@ def build_parser() -> argparse.ArgumentParser:
     stage_install.add_argument("packages", nargs="+")
     stage_install.add_argument("--yes", action="store_true", help="confirm the reboot-required generation")
 
+    system = commands.add_parser("system", help="stage a Fedora system package generation for reboot activation")
+    system_commands = system.add_subparsers(dest="system_command", required=True)
+    system_install = system_commands.add_parser("install", help="stage a Fedora package in a new system generation")
+    system_install.add_argument("packages", nargs="+")
+    system_remove = system_commands.add_parser("remove", help="stage removal of explicitly requested system packages")
+    system_remove.add_argument("packages", nargs="+")
+    system_upgrade = system_commands.add_parser("upgrade", help="stage a Fedora system package upgrade")
+    system_commands.add_parser("rollback", help="select the previous native system generation")
+
     commands.add_parser("upgrade", help="upgrade installed Veyra extensions and app-layer packages")
     commands.add_parser("rollback", help="restore the previous app-layer generation")
     pin = commands.add_parser("pin", help="pin a repository app to an exact RPM EVR")
@@ -2764,38 +3514,54 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("--version", required=True)
     commands.add_parser("sync", help=argparse.SUPPRESS)
     commands.add_parser("check-extensions", help=argparse.SUPPRESS)
+    commands.add_parser("complete-system-trial", help=argparse.SUPPRESS)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
+        vforge = is_vforge_environment()
+        if vforge:
+            validate_container_root()
+            if arguments.command not in {"repos", "search", "info", "list", "install", "remove", "upgrade"}:
+                raise VpkgError(
+                    f"vpkg {arguments.command} manages host package state and is unavailable inside Vforge."
+                )
         if arguments.command == "channel":
             if arguments.name:
                 set_channel(arguments.name)
             else:
                 print(f"Veyra package channel: {selected_channel()}")
         elif arguments.command == "repos":
-            print(f"Selected Veyra channel: {selected_channel()} ({repo_id()})")
             require_root()
-            show_repositories()
+            if vforge:
+                print("Vforge package repositories:")
+            else:
+                print(f"Selected Veyra channel: {selected_channel()} ({repo_id()})")
+            show_repositories(vforge=vforge)
         elif arguments.command == "search":
             require_root()
-            show_search(arguments.terms)
+            show_search(arguments.terms, vforge=vforge)
         elif arguments.command == "info":
             require_root()
-            show_package_info(arguments.packages)
+            show_package_info(arguments.packages, vforge=vforge)
         elif arguments.command == "list":
             require_root()
-            show_package_list(arguments.available)
+            show_package_list(arguments.available, vforge=vforge)
         elif arguments.command == "install":
-            install(arguments.packages)
+            vforge_package_transaction("install", arguments.packages) if vforge else install(arguments.packages)
         elif arguments.command == "remove":
-            remove(arguments.packages)
+            vforge_package_transaction("remove", arguments.packages) if vforge else remove(arguments.packages)
         elif arguments.command == "stage" and arguments.stage_command == "install":
             stage_user_apps(arguments.packages, assume_yes=arguments.yes)
+        elif arguments.command == "system":
+            if arguments.system_command == "rollback":
+                rollback_system_generation()
+            else:
+                stage_system_generation(arguments.system_command, getattr(arguments, "packages", []))
         elif arguments.command == "upgrade":
-            upgrade()
+            vforge_package_transaction("upgrade", None) if vforge else upgrade()
         elif arguments.command == "rollback":
             rollback_user_apps()
         elif arguments.command == "pin":
@@ -2815,6 +3581,8 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "check-extensions":
             require_root()
             with_lock(check_extensions_active)
+        elif arguments.command == "complete-system-trial":
+            complete_system_generation_trial()
     except VpkgError as error:
         print(f"vpkg: {error}", file=sys.stderr)
         return 1

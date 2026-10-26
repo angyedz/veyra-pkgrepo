@@ -1,6 +1,6 @@
 Name:           veyra-vpkg
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Native RPM package manager for Veyra Linux
 License:        LicenseRef-Veyra
 BuildArch:      noarch
@@ -26,6 +26,7 @@ keeps the DNF command-line client out of the Veyra host image.
 install -Dpm0755 usr/bin/vpkg %{buildroot}%{_bindir}/vpkg
 install -Dpm0644 usr/lib/veyra/vpkg_libdnf.py %{buildroot}%{_libdir}/veyra/vpkg_libdnf.py
 install -Dpm0644 usr/lib/veyra/veyra_repo.py %{buildroot}%{_libdir}/veyra/veyra_repo.py
+install -Dpm0755 usr/libexec/veyra-vpkg-initrd.py %{buildroot}%{_libexecdir}/veyra-vpkg-initrd.py
 install -Dpm0644 usr/share/veyra/RPM-GPG-KEY-VEYRA %{buildroot}%{_datadir}/veyra/RPM-GPG-KEY-VEYRA
 install -Dpm0644 usr/share/veyra/vpkg/protected-core.json %{buildroot}%{_datadir}/veyra/vpkg/protected-core.json
 install -Dpm0644 etc/yum.repos.d/veyra-main.repo %{buildroot}%{_sysconfdir}/yum.repos.d/veyra-main.repo
@@ -41,6 +42,7 @@ install -Dpm0644 usr/lib/systemd/system-preset/99-veyra-vpkg.preset %{buildroot}
 %{_bindir}/vpkg
 %{_libdir}/veyra/vpkg_libdnf.py
 %{_libdir}/veyra/veyra_repo.py
+%{_libexecdir}/veyra-vpkg-initrd.py
 %{_datadir}/veyra/RPM-GPG-KEY-VEYRA
 %{_datadir}/veyra/vpkg/protected-core.json
 %config %{_sysconfdir}/yum.repos.d/veyra-main.repo
@@ -53,5 +55,8 @@ install -Dpm0644 usr/lib/systemd/system-preset/99-veyra-vpkg.preset %{buildroot}
 %{_prefix}/lib/systemd/system-preset/99-veyra-vpkg.preset
 
 %changelog
+* Mon Oct 26 2026 Veyra contributors <packages@veyra.invalid> - 0.1.0-2
+- Sync the current vpkg runtime and package the system-generation helper.
+
 * Sun Oct 25 2026 Veyra contributors <packages@veyra.invalid> - 0.1.0-1
 - Package vpkg and its libdnf5 runtime integration.

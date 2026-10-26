@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import unquote, urlparse
 
 
@@ -65,6 +65,7 @@ class Session:
         history_dir: Path,
         persist_dir: Path,
         state_dir: Path,
+        log_dir: Path | None = None,
         no_scripts: bool = True,
         refresh: bool = False,
     ) -> None:
@@ -101,6 +102,8 @@ class Session:
             "skip_unavailable": False,
             "best": True,
         }
+        if log_dir is not None:
+            settings["logdir"] = str(log_dir)
         for name, value in settings.items():
             _set_option(config, name, value)
         if no_scripts:
@@ -193,9 +196,16 @@ class Session:
         *,
         installed_from: Iterable[str] = (),
         local_rpms: Iterable[Path] = (),
+        validate_changes: Callable[[tuple[PackageChange, ...]], None] | None = None,
     ) -> TransactionResult:
         try:
-            return self._resolve(action, specifications, installed_from=installed_from, local_rpms=local_rpms)
+            return self._resolve(
+                action,
+                specifications,
+                installed_from=installed_from,
+                local_rpms=local_rpms,
+                validate_changes=validate_changes,
+            )
         except LibdnfError:
             raise
         except Exception as error:
@@ -208,6 +218,7 @@ class Session:
         *,
         installed_from: Iterable[str],
         local_rpms: Iterable[Path],
+        validate_changes: Callable[[tuple[PackageChange, ...]], None] | None,
     ) -> TransactionResult:
         libdnf5 = self.libdnf5
         goal = libdnf5.base.Goal(self.base)
@@ -263,13 +274,16 @@ class Session:
                     path=package.get_package_path(),
                 )
             )
+        immutable_changes = tuple(changes)
+        if validate_changes is not None:
+            validate_changes(immutable_changes)
         run_result = transaction.run()
         if run_result != transaction.TransactionRunResult_SUCCESS:
             raise LibdnfError(
                 "libdnf5 transaction failed: "
                 + transaction.transaction_result_to_string(run_result)
             )
-        return TransactionResult(tuple(changes), transaction)
+        return TransactionResult(immutable_changes, transaction)
 
 
 def package_query(installroot: Path, releasever: str, repo_ids: Iterable[str], cache_dir: Path):

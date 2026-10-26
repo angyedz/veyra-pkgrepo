@@ -42,8 +42,8 @@ jobs:
             echo "Validated $spec"
           done
           test -s rpms/veyra-release/SOURCES/release.txt
-          python3 -m py_compile sources/veyra-vforge/usr/bin/vforge
-          python3 -m unittest discover -s tests -p 'test_vforge.py' -v
+          python3 -m py_compile sources/veyra-vforge/usr/bin/vforge sources/veyra-vpkg/usr/bin/vpkg sources/veyra-vpkg/usr/libexec/veyra-vpkg-initrd.py sources/veyra-vpkg/usr/lib/veyra/vpkg_libdnf.py sources/veyra-vpkg/usr/lib/veyra/veyra_repo.py
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
           for source_dir in sources/*/; do
             test -d "$source_dir" || continue
             test ! -L "${source_dir%/}"
