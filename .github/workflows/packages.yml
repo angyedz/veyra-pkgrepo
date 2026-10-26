@@ -71,7 +71,7 @@ jobs:
           EOF
           # Keep Fedora 44 enabled for runtime dependencies; the Veyra RPMs
           # are still resolved from the signed local snapshot repository.
-          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update veyra-vforge
+          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update veyra-vforge veyra-v-dri
           test -s /usr/share/veyra/release
           test -x /usr/bin/vpkg
           test -s /usr/lib/veyra/vpkg_libdnf.py
@@ -85,6 +85,8 @@ jobs:
           test -x /usr/bin/veyra-update
           test -s /usr/lib/sysupdate.d/99-uki.transfer
           test -x /usr/bin/vforge
+          test -x /usr/bin/v-dri
+          /usr/bin/v-dri --help >/dev/null
           vforge --help > /tmp/veyra-vforge-help.txt
           grep -Fq 'Native Veyra environments using OverlayFS' /tmp/veyra-vforge-help.txt
           for requirement in python3 util-linux; do
