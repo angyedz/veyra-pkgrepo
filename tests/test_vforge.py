@@ -48,6 +48,20 @@ class VforgeNativeTests(unittest.TestCase):
         self.assertTrue(Path(metadata["work"]).is_dir())
         self.assertEqual(vforge.environment_metadata(path), metadata)
 
+    def test_home_permission_metadata_migration_preserves_environment_identity(self) -> None:
+        path = vforge.create("backend")
+        metadata_path = path / "environment.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["root_id"] = "c" * 32
+        metadata.pop("home_mode")
+        metadata_path.write_text(json.dumps(metadata))
+
+        migrated = vforge.environment_metadata(path)
+
+        self.assertEqual(migrated["schema"], 2)
+        self.assertEqual(migrated["home_mode"], "none")
+        self.assertEqual(migrated["root_id"], "c" * 32)
+
     def test_namespace_entry_binds_to_the_current_veyra_base_and_rejects_changed_base(self) -> None:
         path = vforge.create("backend")
         original = {"image_id": "veyra-next", "image_version": "0.1.0", "base_digest": "a" * 64}
@@ -200,12 +214,12 @@ class VforgeNativeTests(unittest.TestCase):
     def test_project_network_is_isolated_unless_shared_is_requested(self) -> None:
         project = self.root / "source"
         project.mkdir()
-        self.assertEqual(vforge.project_settings(project), ("source", [], "isolated", []))
+        self.assertEqual(vforge.project_settings(project), ("source", [], "isolated", "project-only", []))
 
         (project / ".vforge.toml").write_text(
             '[environment]\nname = "backend"\n[permissions]\nnetwork = "shared"\n'
         )
-        self.assertEqual(vforge.project_settings(project), ("backend", [], "shared", []))
+        self.assertEqual(vforge.project_settings(project), ("backend", [], "shared", "project-only", []))
 
     def test_project_package_requests_are_validated(self) -> None:
         project = self.root / "source"
@@ -216,7 +230,7 @@ class VforgeNativeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        self.assertEqual(vforge.project_settings(project), ("source", [], "isolated", ["python3", "nodejs", "git"]))
+        self.assertEqual(vforge.project_settings(project), ("source", [], "isolated", "project-only", ["python3", "nodejs", "git"]))
 
         config.write_text('[packages]\nsystem = ["--installroot=/"]\n', encoding="utf-8")
         with self.assertRaisesRegex(vforge.VforgeError, "package name"):
@@ -277,6 +291,78 @@ class VforgeNativeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(vforge.VforgeError, "network must be isolated or shared"):
             vforge.project_settings(project)
+
+    def test_project_home_modes_are_parsed_and_invalid_modes_are_rejected(self) -> None:
+        project = self.root / "source"
+        project.mkdir()
+        config = project / ".vforge.toml"
+        for mode in ("none", "project-only", "read-only", "read-write"):
+            config.write_text(f'[permissions.home]\nmode = "{mode}"\n', encoding="utf-8")
+            self.assertEqual(vforge.project_settings(project)[3], mode)
+
+        config.write_text('[permissions.home]\nmode = "everything"\n', encoding="utf-8")
+        with self.assertRaisesRegex(vforge.VforgeError, "permissions.home.mode"):
+            vforge.project_settings(project)
+
+    def test_host_home_permissions_require_and_store_explicit_approval(self) -> None:
+        project = self.root / "source"
+        project.mkdir()
+        with patch.object(vforge, "confirm_home_permission") as confirm:
+            path = vforge.create("backend", project=project, home_mode="read-only")
+
+        confirm.assert_called_once_with("backend", "read-only")
+        self.assertEqual(vforge.environment_metadata(path)["home_mode"], "read-only")
+        self.assertEqual(vforge.project_home_approval(project), "read-only")
+
+        with patch.object(vforge, "confirm_home_permission") as confirm:
+            vforge.create("backend", project=project, home_mode="read-write")
+
+        confirm.assert_called_once_with("backend", "read-write")
+        self.assertEqual(vforge.project_home_approval(project), "read-write")
+
+    def test_host_home_permission_fails_closed_without_interactive_approval(self) -> None:
+        project = self.root / "source"
+        project.mkdir()
+        with (
+            patch.object(vforge.sys.stdin, "isatty", return_value=False),
+            self.assertRaisesRegex(vforge.VforgeError, "requires interactive approval"),
+        ):
+            vforge.create("backend", project=project, home_mode="read-write")
+
+        self.assertFalse((project / ".vforge" / "backend").exists())
+
+    def test_revoked_host_home_permission_stops_environment_entry(self) -> None:
+        project = self.root / "source"
+        project.mkdir()
+        (project / ".vforge.toml").write_text(
+            '[permissions.home]\nmode = "read-only"\n', encoding="utf-8"
+        )
+        with patch.object(vforge, "confirm_home_permission"):
+            path = vforge.create("backend", project=project, home_mode="read-only")
+        approvals = json.loads((vforge.config_directory() / vforge.PERMISSION_FILE).read_text())
+        approvals["home_projects"].pop(str(project))
+        (vforge.config_directory() / vforge.PERMISSION_FILE).write_text(json.dumps(approvals))
+
+        with patch.object(vforge.subprocess, "run") as run:
+            with self.assertRaisesRegex(vforge.VforgeError, "Home permission is not approved"):
+                vforge.namespace_command(path, ["/bin/true"])
+
+        run.assert_not_called()
+
+    def test_home_mode_change_stops_environment_until_project_up(self) -> None:
+        project = self.root / "source"
+        project.mkdir()
+        config = project / ".vforge.toml"
+        config.write_text('[permissions.home]\nmode = "read-only"\n', encoding="utf-8")
+        with patch.object(vforge, "confirm_home_permission"):
+            path = vforge.create("backend", project=project, home_mode="read-only")
+        config.write_text('[permissions.home]\nmode = "project-only"\n', encoding="utf-8")
+
+        with patch.object(vforge.subprocess, "run") as run:
+            with self.assertRaisesRegex(vforge.VforgeError, "permissions changed"):
+                vforge.namespace_command(path, ["/bin/true"])
+
+        run.assert_not_called()
 
     def test_shared_project_network_requires_recorded_user_approval(self) -> None:
         project = self.root / "source"
@@ -383,6 +469,45 @@ class VforgeNativeTests(unittest.TestCase):
         )
         self.assertEqual(mountpoints, [str(lower)])
 
+    def test_unmount_inherited_submounts_skips_a_mount_already_detached(self) -> None:
+        lower = Path("/run/veyra-vforge/lower")
+        mountinfo = (
+            "40 30 0:1 / /run/veyra-vforge/lower ro,relatime - erofs /dev/root ro\n"
+            "41 40 0:2 / /run/veyra-vforge/lower/sys ro,relatime - sysfs sysfs ro\n"
+            "42 41 0:3 / /run/veyra-vforge/lower/sys/fs/fuse/connections rw,relatime - fusectl fusectl rw\n"
+        )
+        current_mountinfo = "40 30 0:1 / /run/veyra-vforge/lower ro,relatime - erofs /dev/root ro\n"
+        mountpoints = [str(lower)]
+
+        with (
+            patch.object(vforge, "run", side_effect=[vforge.VforgeError("not mounted"), None]) as run,
+            patch.object(Path, "read_text", return_value=current_mountinfo),
+        ):
+            vforge.unmount_inherited_submounts(lower, mountpoints, mountinfo)
+
+        self.assertEqual(
+            [call.args[0][-1] for call in run.call_args_list],
+            [str(lower / "sys/fs/fuse/connections"), str(lower / "sys")],
+        )
+        self.assertEqual(mountpoints, [str(lower)])
+
+    def test_unmount_inherited_submounts_keeps_failing_if_mount_is_still_present(self) -> None:
+        lower = Path("/run/veyra-vforge/lower")
+        mountinfo = (
+            "40 30 0:1 / /run/veyra-vforge/lower ro,relatime - erofs /dev/root ro\n"
+            "41 40 0:2 / /run/veyra-vforge/lower/sys ro,relatime - sysfs sysfs ro\n"
+        )
+        mountpoints = [str(lower)]
+
+        with (
+            patch.object(vforge, "run", side_effect=vforge.VforgeError("device busy")),
+            patch.object(Path, "read_text", return_value=mountinfo),
+        ):
+            with self.assertRaisesRegex(vforge.VforgeError, "device busy"):
+                vforge.unmount_inherited_submounts(lower, mountpoints, mountinfo)
+
+        self.assertEqual(mountpoints, [str(lower), str(lower / "sys")])
+
     def test_vforge_marker_identifies_active_veyra_root_and_overlay(self) -> None:
         root = self.root / "root"
         (root / "usr/lib").mkdir(parents=True)
@@ -443,6 +568,17 @@ class VforgeNativeTests(unittest.TestCase):
         parsed = vforge.build_parser().parse_args(["create", "toolbox", "--network", "shared"])
         self.assertEqual(parsed.network, "shared")
 
+    def test_named_environment_home_access_requires_explicit_confirmation(self) -> None:
+        with patch.object(vforge, "confirm_home_permission") as confirm:
+            path = vforge.create("backend", home_mode="read-write")
+
+        confirm.assert_called_once_with("backend", "read-write")
+        self.assertEqual(vforge.environment_metadata(path)["home_mode"], "read-write")
+        parsed = vforge.build_parser().parse_args(["create", "toolbox", "--home", "read-only"])
+        self.assertEqual(parsed.home_mode, "read-only")
+        with self.assertRaisesRegex(vforge.VforgeError, "project-only Home mode"):
+            vforge.create("project-only", home_mode="project-only")
+
     def test_environment_unmounts_private_mounts_before_removing_runtime_tree(self) -> None:
         environment = vforge.create("backend")
         runtime = self.root / "runtime"
@@ -485,6 +621,49 @@ class VforgeNativeTests(unittest.TestCase):
         ]
         self.assertEqual(lower_remounts, [])
         self.assertEqual(list((runtime / "vforge").iterdir()), [])
+
+    def test_read_only_home_is_bound_read_only_inside_environment(self) -> None:
+        project = self.root / "source"
+        project.mkdir()
+        (project / ".vforge.toml").write_text(
+            '[environment]\nname = "backend"\n[permissions.home]\nmode = "read-only"\n',
+            encoding="utf-8",
+        )
+        with patch.object(vforge, "confirm_home_permission"):
+            environment = vforge.create("backend", project=project, home_mode="read-only")
+        host_home = self.root / "host-home"
+        host_home.mkdir(mode=0o700)
+        runtime = self.root / "runtime"
+        runtime.mkdir(mode=0o700)
+        mounts: list[tuple[str, str, bool]] = []
+
+        def fake_run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def fake_bind_mount(source: str, target: str, *, readonly: bool = False, mountpoints=None) -> None:
+            mounts.append((source, target, readonly))
+            if mountpoints is not None:
+                mountpoints.append(target)
+
+        with (
+            patch.dict(os.environ, {
+                "XDG_RUNTIME_DIR": str(runtime),
+                vforge.HOST_HOME_NAME_ENV: "fixture-user",
+                vforge.HOST_HOME_PATH_ENV: str(host_home),
+            }),
+            patch.object(vforge, "verify_immutable_root_mount"),
+            patch.object(vforge, "veyra_root_marker", return_value={}),
+            patch.object(vforge, "run", side_effect=fake_run),
+            patch.object(vforge, "mount_in_namespace", side_effect=fake_bind_mount),
+            patch.object(vforge.os, "fork", return_value=12345),
+            patch.object(vforge.os, "waitpid", return_value=(12345, 0)),
+        ):
+            self.assertEqual(vforge.run_environment(environment, ["/bin/true"]), 0)
+
+        self.assertIn((str(host_home), mounts_target := next(
+            target for source, target, _ in mounts if source == str(host_home)
+        ), True), mounts)
+        self.assertTrue(mounts_target.endswith("/home/fixture-user"))
 
     def test_bind_mount_pins_regular_files_and_rejects_symlinks(self) -> None:
         source = self.root / "device"

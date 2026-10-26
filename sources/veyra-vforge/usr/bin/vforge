@@ -8,6 +8,7 @@ import errno
 import fcntl
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -31,6 +32,10 @@ VEYRA_IMAGE_ID = "veyra-next"
 PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.-]{0,254}$")
 SNAPSHOT_ID_RE = re.compile(r"^[0-9]{10,}-[0-9a-f]{8}$")
 MAX_PROJECT_PACKAGES = 128
+HOME_MODES = {"none", "project-only", "read-only", "read-write"}
+PRIVILEGED_HOME_MODES = {"read-only", "read-write"}
+HOST_HOME_NAME_ENV = "VEYRA_VFORGE_HOST_HOME_NAME"
+HOST_HOME_PATH_ENV = "VEYRA_VFORGE_HOST_HOME_PATH"
 
 
 class VforgeError(Exception):
@@ -197,6 +202,11 @@ def environment_metadata(path: Path) -> dict:
     if not isinstance(network, str) or network not in {"isolated", "shared"}:
         raise VforgeError("environment metadata has an invalid network permission")
     project = value.get("project")
+    missing_home_mode = "home_mode" not in value
+    home_mode = value.setdefault("home_mode", "project-only" if project is not None else "none")
+    if (not isinstance(home_mode, str) or home_mode not in HOME_MODES
+            or project is None and home_mode == "project-only"):
+        raise VforgeError("environment metadata has an invalid Home permission")
     if project is None:
         expected = store_root() / "environments" / name
         if path != expected:
@@ -218,7 +228,9 @@ def environment_metadata(path: Path) -> dict:
         validate_base_identity(value["base_identity"])
     if value.get("schema") == 1 or root_id is None:
         value["schema"] = 2
-        value["root_id"] = uuid.uuid4().hex
+        value["root_id"] = root_id or uuid.uuid4().hex
+        write_metadata(path, value)
+    elif missing_home_mode:
         write_metadata(path, value)
     return value
 
@@ -341,13 +353,16 @@ def normalize_mounts(items: object) -> list[dict[str, str]]:
 def project_permission_state() -> dict:
     approval_path = config_directory() / PERMISSION_FILE
     state = read_private_json_optional(
-        approval_path, "Vforge permission approvals", {"schema": 1, "projects": {}, "network_projects": {}}
+        approval_path, "Vforge permission approvals",
+        {"schema": 1, "projects": {}, "network_projects": {}, "home_projects": {}},
     )
     if (not isinstance(state, dict) or state.get("schema") != 1
             or not isinstance(state.get("projects"), dict)
-            or not isinstance(state.get("network_projects", {}), dict)):
+            or not isinstance(state.get("network_projects", {}), dict)
+            or not isinstance(state.get("home_projects", {}), dict)):
         raise VforgeError("Vforge permission approval state is malformed")
     state.setdefault("network_projects", {})
+    state.setdefault("home_projects", {})
     for project_name in state["projects"]:
         if not isinstance(project_name, str) or not Path(project_name).is_absolute():
             raise VforgeError("Vforge permission approval state contains an invalid project path")
@@ -358,6 +373,11 @@ def project_permission_state() -> dict:
         if (not isinstance(project_name, str) or not Path(project_name).is_absolute()
                 or network != "shared"):
             raise VforgeError("Vforge permission approval state contains an invalid network grant")
+    home_projects = state["home_projects"]
+    for project_name, mode in home_projects.items():
+        if (not isinstance(project_name, str) or not Path(project_name).is_absolute()
+                or not isinstance(mode, str) or mode not in PRIVILEGED_HOME_MODES):
+            raise VforgeError("Vforge permission approval state contains an invalid Home grant")
     return state
 
 
@@ -369,11 +389,16 @@ def project_network_approval(project: Path) -> str:
     return project_permission_state()["network_projects"].get(str(project), "isolated")
 
 
+def project_home_approval(project: Path) -> str:
+    return project_permission_state()["home_projects"].get(str(project), "project-only")
+
+
 def authorize_project_permissions(
     name: str,
     project: Path,
     requested_mounts: list[dict[str, str]],
     requested_network: str,
+    requested_home_mode: str,
 ) -> None:
     approval_path = config_directory() / PERMISSION_FILE
     state = project_permission_state()
@@ -384,6 +409,14 @@ def authorize_project_permissions(
         confirm_permissions(name, added_mounts)
     if requested_network == "shared" and state["network_projects"].get(project_key) != "shared":
         confirm_network_permission(name)
+    approved_home = state["home_projects"].get(project_key, "project-only")
+    if requested_home_mode in PRIVILEGED_HOME_MODES:
+        if (requested_home_mode == "read-write" and approved_home != "read-write"
+                or requested_home_mode == "read-only" and approved_home not in PRIVILEGED_HOME_MODES):
+            confirm_home_permission(name, requested_home_mode)
+        state["home_projects"][project_key] = requested_home_mode
+    else:
+        state["home_projects"].pop(project_key, None)
 
     if requested_mounts:
         state["projects"][project_key] = requested_mounts
@@ -416,23 +449,38 @@ def confirm_network_permission(name: str) -> None:
         raise VforgeError("shared network access was not granted")
 
 
+def confirm_home_permission(name: str, mode: str) -> None:
+    access = "read-only" if mode == "read-only" else "read and write"
+    print(f"Environment '{name}' requests {access} access to the host Home directory.")
+    if not sys.stdin.isatty():
+        raise VforgeError("host Home access requires interactive approval")
+    if input("Allow this Home access? [y/N] ").strip().lower() not in {"y", "yes"}:
+        raise VforgeError("host Home access was not granted")
+
+
 def create(
     name: str,
     *,
     project: Path | None = None,
     mounts: list[dict[str, str]] | None = None,
     network: str = "isolated",
+    home_mode: str | None = None,
 ) -> Path:
     validate_name(name)
     if not isinstance(network, str) or network not in {"isolated", "shared"}:
         raise VforgeError("network must be isolated or shared")
+    if home_mode is None:
+        home_mode = "project-only" if project is not None else "none"
+    if (not isinstance(home_mode, str) or home_mode not in HOME_MODES
+            or project is None and home_mode == "project-only"):
+        raise VforgeError("project-only Home mode requires a project environment")
     if project is not None:
         project = project.resolve(strict=True)
         if not project.is_dir():
             raise VforgeError("project path must be a directory")
         ensure_private_directory(project / ".vforge")
         requested = validate_mount_records(mounts or [])
-        authorize_project_permissions(name, project, requested, network)
+        authorize_project_permissions(name, project, requested, network, home_mode)
     else:
         requested = validate_mount_records(mounts or [])
         if requested:
@@ -441,9 +489,17 @@ def create(
         ensure_private_directory(store_root() / "environments")
         if network == "shared":
             existing = environment_path(name)
-            previous_network = environment_metadata(existing).get("network", "isolated") if existing.exists() else "isolated"
+            existing_metadata = environment_metadata(existing) if existing.exists() else {}
+            previous_network = existing_metadata.get("network", "isolated")
             if previous_network != "shared":
                 confirm_network_permission(name)
+        else:
+            existing = environment_path(name)
+            existing_metadata = environment_metadata(existing) if existing.exists() else {}
+        previous_home_mode = existing_metadata.get("home_mode", "none")
+        if home_mode in PRIVILEGED_HOME_MODES and previous_home_mode != home_mode:
+            if home_mode == "read-write" or previous_home_mode not in PRIVILEGED_HOME_MODES:
+                confirm_home_permission(name, home_mode)
     path = environment_path(name, project=project)
     if path.is_symlink():
         raise VforgeError("project Vforge state may not use symlinks")
@@ -453,9 +509,11 @@ def create(
             raise VforgeError(f"environment '{name}' already belongs to a different project")
         previous = current.get("mounts", [])
         previous_network = current.get("network", "isolated")
-        if requested != previous or previous_network != network:
+        previous_home_mode = current.get("home_mode", "project-only" if project else "none")
+        if requested != previous or previous_network != network or previous_home_mode != home_mode:
             current["mounts"] = requested
             current["network"] = network
+            current["home_mode"] = home_mode
             write_metadata(path, current)
         print(f"Environment '{name}' already exists at {path}")
         return path
@@ -474,6 +532,7 @@ def create(
         "project": str(project) if project else None,
         "mounts": requested,
         "network": network,
+        "home_mode": home_mode,
         "base_identity": None,
     }
     write_metadata(path, metadata)
@@ -496,12 +555,12 @@ def project_packages(value: object) -> list[str]:
     return requested
 
 
-def project_settings(project: Path) -> tuple[str, list[dict[str, str]], str, list[str]]:
+def project_settings(project: Path) -> tuple[str, list[dict[str, str]], str, str, list[str]]:
     config = project / PROJECT_CONFIG
     try:
         descriptor = os.open(config, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
-        return project.name.lower().replace(" ", "-")[:55] or "project", [], "isolated", []
+        return project.name.lower().replace(" ", "-")[:55] or "project", [], "isolated", "project-only", []
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise VforgeError("project Vforge configuration may not be a symlink") from error
@@ -525,20 +584,23 @@ def project_settings(project: Path) -> tuple[str, list[dict[str, str]], str, lis
     name = validate_name(str(environment.get("name", project.name.lower().replace(" ", "-")[:55])))
     if environment.get("isolation", "integrated") != "integrated":
         raise VforgeError("native Vforge currently supports only the integrated isolation profile")
-    home_mode = permissions.get("home", {}).get("mode", "project-only") if isinstance(permissions.get("home", {}), dict) else None
-    if home_mode != "project-only":
-        raise VforgeError("native Vforge currently supports project-only Home access")
+    home_settings = permissions.get("home", {})
+    if not isinstance(home_settings, dict) or set(home_settings) - {"mode"}:
+        raise VforgeError("[permissions.home] must contain only mode")
+    home_mode = home_settings.get("mode", "project-only")
+    if not isinstance(home_mode, str) or home_mode not in HOME_MODES:
+        raise VforgeError("permissions.home.mode must be none, project-only, read-only, or read-write")
     mounts = normalize_mounts(permissions.get("mounts", []))
     network = permissions.get("network", "isolated")
     if not isinstance(network, str) or network not in {"isolated", "shared"}:
         raise VforgeError("permissions.network must be isolated or shared")
-    return name, mounts, network, project_packages(packages)
+    return name, mounts, network, home_mode, project_packages(packages)
 
 
 def project_environment(cwd: Path) -> tuple[Path, list[str]]:
     project = cwd.resolve()
-    name, mounts, network, packages = project_settings(project)
-    return create(name, project=project, mounts=mounts, network=network), packages
+    name, mounts, network, home_mode, packages = project_settings(project)
+    return create(name, project=project, mounts=mounts, network=network, home_mode=home_mode), packages
 
 
 def project_up(cwd: Path) -> Path:
@@ -594,8 +656,15 @@ def _namespace_command_locked(
     if metadata["network"] == "isolated":
         arguments.append("--net")
     arguments.extend([sys.executable, str(Path(__file__).resolve()), "_run", str(path), *command])
+    environment = os.environ.copy()
+    environment.pop(HOST_HOME_NAME_ENV, None)
+    environment.pop(HOST_HOME_PATH_ENV, None)
+    if metadata.get("home_mode", "project-only" if metadata.get("project") else "none") in PRIVILEGED_HOME_MODES:
+        home_name, home_path = current_host_home()
+        environment[HOST_HOME_NAME_ENV] = home_name
+        environment[HOST_HOME_PATH_ENV] = str(home_path)
     try:
-        result = subprocess.run(arguments)
+        result = subprocess.run(arguments, env=environment)
     except FileNotFoundError as error:
         raise VforgeError("the unshare utility is required for native Vforge environments") from error
     if result.returncode:
@@ -608,14 +677,53 @@ def verify_project_mount_approvals(metadata: dict) -> None:
     if project is None:
         return
     project_path = Path(project)
-    _, configured_mounts, configured_network, _ = project_settings(project_path)
-    if configured_mounts != metadata.get("mounts", []) or configured_network != metadata.get("network", "isolated"):
+    _, configured_mounts, configured_network, configured_home, _ = project_settings(project_path)
+    if (configured_mounts != metadata.get("mounts", [])
+            or configured_network != metadata.get("network", "isolated")
+            or configured_home != metadata.get("home_mode", "project-only")):
         raise VforgeError("project Vforge permissions changed; run `vforge up` to review and apply them")
     approved = project_mount_approvals(project_path)
     if any(mount not in approved for mount in metadata.get("mounts", [])):
         raise VforgeError("project environment contains unapproved host mounts; review .vforge.toml with `vforge up`")
     if metadata.get("network", "isolated") == "shared" and project_network_approval(project_path) != "shared":
         raise VforgeError("shared network permission is not approved; review .vforge.toml with `vforge up`")
+    home_mode = metadata.get("home_mode", "project-only")
+    approved_home = project_home_approval(project_path)
+    if (home_mode == "read-write" and approved_home != "read-write"
+            or home_mode == "read-only" and approved_home not in PRIVILEGED_HOME_MODES):
+        raise VforgeError("host Home permission is not approved; review .vforge.toml with `vforge up`")
+
+
+def current_host_home() -> tuple[str, Path]:
+    try:
+        account = pwd.getpwuid(os.getuid())
+        home = Path(account.pw_dir)
+        resolved = home.resolve(strict=True)
+    except (KeyError, OSError, RuntimeError) as error:
+        raise VforgeError("cannot safely resolve the current user's Home directory") from error
+    if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", account.pw_name)
+            or account.pw_name in {".", ".."} or not home.is_absolute()
+            or ".." in home.parts or resolved == Path("/") or not resolved.is_dir()):
+        raise VforgeError("the current user's Home directory is not a safe directory")
+    return account.pw_name, resolved
+
+
+def selected_host_home() -> tuple[str, Path]:
+    name = os.environ.get(HOST_HOME_NAME_ENV)
+    path = os.environ.get(HOST_HOME_PATH_ENV)
+    if name is None and path is None:
+        return current_host_home()
+    if name is None or path is None:
+        raise VforgeError("the approved host Home identity is incomplete")
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise VforgeError("the approved host Home directory is unavailable") from error
+    if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) or name in {".", ".."}
+            or not Path(path).is_absolute() or ".." in Path(path).parts
+            or Path(path) != resolved or resolved == Path("/") or not resolved.is_dir()):
+        raise VforgeError("the approved host Home identity is unsafe")
+    return name, resolved
 
 
 def mount_in_namespace(
@@ -686,7 +794,18 @@ def unmount_inherited_submounts(
     # partially detached tree safely if one of the umount operations fails.
     mountpoints.extend(inherited)
     for target in reversed(inherited):
-        run(["umount", "--", target])
+        try:
+            run(["umount", "--", target])
+        except VforgeError:
+            # A parent detach or a concurrent mount cleanup can remove a
+            # nested mount after the initial snapshot. Treat that as already
+            # unmounted, but keep failing when the mount is still present.
+            try:
+                current_mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                raise VforgeError("cannot recheck the Vforge mount table after unmount failed") from error
+            if target in mountpoints_below(current_mountinfo, root):
+                raise
         mountpoints.remove(target)
 
 
@@ -1079,6 +1198,16 @@ def run_environment(path: Path, command: Sequence[str]) -> int:
             mount_at(merged / "tmp", ["mount", "-t", "tmpfs", "-o", "mode=1777,nosuid,nodev", "tmpfs", str(merged / "tmp")])
             mount_at(merged / "run", ["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "run")])
             mount_at(merged / "home", ["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "home")])
+            home_mode = metadata.get("home_mode", "project-only" if metadata.get("project") else "none")
+            home_name = None
+            if home_mode in PRIVILEGED_HOME_MODES:
+                home_name, home_path = selected_host_home()
+                home_target = merged / "home" / home_name
+                home_target.mkdir(mode=0o700)
+                mount_in_namespace(
+                    str(home_path), str(home_target), readonly=home_mode == "read-only",
+                    mountpoints=mountpoints,
+                )
             marker = veyra_root_marker(metadata, merged)
             marker_directory = merged / "run/veyra-vforge"
             marker_directory.mkdir(mode=0o755)
@@ -1097,7 +1226,12 @@ def run_environment(path: Path, command: Sequence[str]) -> int:
                     for key, value in os.environ.items():
                         if key == "TERM" or key == "LANG" or key.startswith("LC_"):
                             safe_environment[key] = value
-                    safe_environment["HOME"] = "/workspace" if metadata.get("project") else "/tmp"
+                    if home_mode in PRIVILEGED_HOME_MODES and home_name is not None:
+                        safe_environment["HOME"] = f"/home/{home_name}"
+                    elif home_mode == "project-only" and metadata.get("project"):
+                        safe_environment["HOME"] = "/workspace"
+                    else:
+                        safe_environment["HOME"] = "/tmp"
                     os.execvpe(command[0], list(command), safe_environment)
                 except (OSError, VforgeError) as error:
                     print(f"vforge: cannot start command in environment: {error}", file=sys.stderr)
@@ -1129,7 +1263,7 @@ def environment_target(name: str | None, cwd: Path) -> Path:
     if name is not None:
         return environment_path(name)
     project = cwd.resolve()
-    project_name, _, _, _ = project_settings(project)
+    project_name, _, _, _, _ = project_settings(project)
     return environment_path(project_name, project=project)
 
 
@@ -1149,6 +1283,8 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("name")
     create_parser.add_argument("--storage-root", type=Path, help="select the persistent root for named environments")
     create_parser.add_argument("--network", choices=("isolated", "shared"), default="isolated")
+    create_parser.add_argument("--home", dest="home_mode", choices=tuple(sorted(HOME_MODES - {"project-only"})),
+                               default="none", help="host Home access for this named environment")
     for action in ("enter", "exec", "delete"):
         sub = subparsers.add_parser(action)
         sub.add_argument("name", nargs="?" if action == "enter" else None)
@@ -1199,7 +1335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 selected = selected.resolve()
                 ensure_private_directory(selected)
                 write_private_json(config_directory() / "config.json", {"storage_root": str(selected)}, "Vforge configuration")
-            create(args.name, network=args.network)
+            create(args.name, network=args.network, home_mode=args.home_mode)
             return 0
         if args.action == "up":
             project_up(Path.cwd())
