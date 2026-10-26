@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'rpms/**'
+      - 'sources/**'
       - 'scripts/**'
       - '.github/workflows/publish-rpm.yml'
   workflow_dispatch:

@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'rpms/**'
+      - 'sources/**'
       - 'scripts/**'
       - '.github/workflows/source-checks.yml'
       - '.github/workflows/packages.yml'
@@ -12,6 +13,7 @@ on:
     branches: [main]
     paths:
       - 'rpms/**'
+      - 'sources/**'
       - 'scripts/**'
       - '.github/workflows/source-checks.yml'
       - '.github/workflows/packages.yml'
@@ -27,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install spec parser
-        run: dnf -y install rpm-build bash
+        run: dnf -y install rpm-build bash python3
       - name: Validate package specs and build script
         run: |
           set -euo pipefail
@@ -40,3 +42,10 @@ jobs:
             echo "Validated $spec"
           done
           test -s rpms/veyra-release/SOURCES/release.txt
+          python3 -m py_compile sources/veyra-vforge/usr/bin/vforge sources/veyra-v-dri/usr/bin/v-dri sources/veyra-vpkg/usr/bin/vpkg sources/veyra-vpkg/usr/libexec/veyra-vpkg-initrd.py sources/veyra-vpkg/usr/lib/veyra/vpkg_libdnf.py sources/veyra-vpkg/usr/lib/veyra/veyra_repo.py
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          for source_dir in sources/*/; do
+            test -d "$source_dir" || continue
+            test ! -L "${source_dir%/}"
+            printf 'Validated source tree %s\n' "$source_dir"
+          done

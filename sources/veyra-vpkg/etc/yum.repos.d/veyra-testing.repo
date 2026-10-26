@@ -1,0 +1,8 @@
+[veyra-testing]
+name=Veyra additional packages (testing)
+baseurl=file:///var/cache/veyra/vpkg/repositories/testing/current/$basearch/
+enabled=0
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///usr/share/veyra/RPM-GPG-KEY-VEYRA
+metadata_expire=1m

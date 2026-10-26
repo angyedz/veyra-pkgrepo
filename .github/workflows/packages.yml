@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'rpms/**'
+      - 'sources/**'
       - 'scripts/**'
       - '.github/workflows/**'
       - 'README.md'
@@ -12,6 +13,7 @@ on:
     branches: [main]
     paths:
       - 'rpms/**'
+      - 'sources/**'
       - 'scripts/**'
       - '.github/workflows/**'
       - 'README.md'
@@ -33,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install RPM repository tools
-        run: dnf -y install rpm-build rpm-sign createrepo_c gnupg2 dnf git findutils coreutils
+        run: dnf -y install rpm-build rpm-sign systemd-rpm-macros createrepo_c gnupg2 dnf git findutils coreutils
 
       - name: Create disposable CI signing key
         env:
@@ -67,8 +69,33 @@ jobs:
           gpgkey=file://$repo_dir/RPM-GPG-KEY-VEYRA
           metadata_expire=0
           EOF
-          dnf -y --disablerepo='*' --enablerepo=veyra-ci install veyra-release
+          # Keep Fedora 44 enabled for runtime dependencies; the Veyra RPMs
+          # are still resolved from the signed local snapshot repository.
+          dnf -y --enablerepo=veyra-ci install veyra-release veyra-vpkg veyra-update veyra-vforge veyra-v-dri
           test -s /usr/share/veyra/release
+          test -x /usr/bin/vpkg
+          test -s /usr/lib/veyra/vpkg_libdnf.py
+          test -s /usr/lib/veyra/veyra_repo.py
+          test -x /usr/libexec/veyra-vpkg-initrd.py
+          rpm -ql veyra-vpkg | grep -Fx /usr/libexec/veyra-vpkg-initrd.py
+          test -s /usr/share/veyra/vpkg/protected-core.json
+          rpm -ql veyra-vpkg | grep -Fx /usr/share/veyra/vpkg/protected-core.json
+          rpm -qf /usr/share/veyra/vpkg/protected-core.json | grep -Eq '^veyra-vpkg-[0-9]'
+          python3 -c 'import json; p=json.load(open("/usr/share/veyra/vpkg/protected-core.json", encoding="utf-8")); assert p["schema"] == 1 and p["supported_base"] == {"id": "fedora", "version_id": "44"}; assert {"glibc", "libdnf5", "python3-libdnf5"}.issubset(p["protected_packages"]["names"]); assert {"/usr/lib/modules/", "/usr/share/veyra/"}.issubset(p["payload_paths"]["denied_prefixes"])'
+          test -x /usr/bin/veyra-update
+          test -s /usr/lib/sysupdate.d/99-uki.transfer
+          test -x /usr/bin/vforge
+          test -x /usr/bin/v-dri
+          /usr/bin/v-dri --help >/dev/null
+          vforge --help > /tmp/veyra-vforge-help.txt
+          grep -Fq 'Native Veyra environments using OverlayFS' /tmp/veyra-vforge-help.txt
+          for requirement in python3 util-linux; do
+            rpm -q --requires veyra-vforge | grep -Fx "$requirement"
+          done
+          if rpm -q --requires veyra-vpkg | grep -Eq '^dnf5(-plugins)?([ <=>].*)?$'; then
+            echo 'veyra-vpkg must not require the DNF5 command-line packages.' >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

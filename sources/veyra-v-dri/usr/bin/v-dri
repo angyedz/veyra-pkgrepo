@@ -1,0 +1,162 @@
+#!/usr/bin/python3
+"""Read-only inventory of DRM devices and their currently bound kernel drivers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+
+SYSFS_ROOT = Path("/sys")
+CARD_RE = re.compile(r"^card[0-9]+$")
+PCI_ID_RE = re.compile(r"^(?:0x)?([0-9a-fA-F]{4})$")
+
+
+class VdriError(Exception):
+    """A sysfs driver inventory could not be read safely."""
+
+
+def _path_in_sysfs(path: Path, root: Path, description: str) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise VdriError(f"{description} is unavailable or escapes the sysfs root") from error
+    return resolved
+
+
+def _pci_id(device_path: Path, root: Path, attribute: str) -> str | None:
+    current = device_path
+    while current == root or root in current.parents:
+        value = current / attribute
+        if value.is_file():
+            try:
+                match = PCI_ID_RE.fullmatch(value.read_text(encoding="ascii").strip())
+            except (OSError, UnicodeError):
+                return None
+            return match.group(1).lower() if match else None
+        if current == root:
+            break
+        current = current.parent
+    return None
+
+
+def _device_status(card: Path, root: Path) -> dict[str, str | None]:
+    device_path = _path_in_sysfs(card / "device", root, f"{card.name} device")
+    driver_link = device_path / "driver"
+    driver_name: str | None = None
+    module_name: str | None = None
+    module_taint: str | None = None
+    status = "unbound"
+
+    if driver_link.exists() or driver_link.is_symlink():
+        driver_path = _path_in_sysfs(driver_link, root, f"{card.name} kernel driver")
+        driver_name = driver_path.name
+        module_link = driver_path / "module"
+        if module_link.exists() or module_link.is_symlink():
+            module_path = _path_in_sysfs(module_link, root, f"{card.name} kernel module")
+            module_name = module_path.name
+            taint_path = module_path / "taint"
+            if taint_path.is_file():
+                try:
+                    module_taint = taint_path.read_text(encoding="ascii").strip()
+                except (OSError, UnicodeError) as error:
+                    raise VdriError(f"Could not read the taint state for {card.name}.") from error
+        status = "external-module-detected" if module_taint and "O" in module_taint else "bound"
+
+    return {
+        "name": card.name,
+        "vendor_id": _pci_id(device_path, root, "vendor"),
+        "device_id": _pci_id(device_path, root, "device"),
+        "driver": driver_name,
+        "module": module_name,
+        "module_taint": module_taint,
+        "status": status,
+    }
+
+
+def collect_status(sysfs_root: Path = SYSFS_ROOT, kernel: str | None = None) -> dict[str, object]:
+    """Return a stable, read-only inventory without invoking host package tools."""
+    try:
+        root = sysfs_root.resolve(strict=True)
+    except OSError as error:
+        raise VdriError(f"Could not access the sysfs root: {sysfs_root}") from error
+    drm_root = root / "class/drm"
+    if not drm_root.is_dir():
+        raise VdriError(f"The DRM sysfs directory is missing: {drm_root}")
+
+    devices = []
+    try:
+        cards = sorted((entry for entry in drm_root.iterdir() if CARD_RE.fullmatch(entry.name)), key=lambda p: p.name)
+    except OSError as error:
+        raise VdriError("Could not enumerate DRM devices.") from error
+    for card in cards:
+        devices.append(_device_status(card, root))
+
+    signature_parameter = root / "module/module/parameters/sig_enforce"
+    try:
+        signature_value = signature_parameter.read_text(encoding="ascii").strip().lower()
+    except (OSError, UnicodeError):
+        signature_enforcement = "unavailable"
+    else:
+        signature_enforcement = "enforced" if signature_value in {"y", "1"} else "permissive"
+
+    return {
+        "schema": 2,
+        "kernel": kernel or os.uname().release,
+        "driver_policy": "fedora-in-tree-only",
+        "module_signature_enforcement": signature_enforcement,
+        "devices": devices,
+    }
+
+
+def _has_problem(result: dict[str, object]) -> bool:
+    devices = result["devices"]
+    if not isinstance(devices, list) or not devices:
+        return True
+    if result.get("module_signature_enforcement") != "enforced":
+        return True
+    return any(not isinstance(device, dict) or device.get("status") != "bound" for device in devices)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="v-dri", description="Inspect Veyra graphics devices and drivers.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    status = commands.add_parser("status", help="show DRM devices and their bound kernel drivers")
+    status.add_argument("--json", action="store_true", help="print the versioned JSON status record")
+    arguments = parser.parse_args(argv)
+
+    try:
+        result = collect_status(SYSFS_ROOT)
+    except VdriError as error:
+        print(f"v-dri: {error}", file=sys.stderr)
+        return 1
+
+    if arguments.json:
+        print(json.dumps(result, sort_keys=True))
+    elif not result["devices"]:
+        print("No DRM graphics devices were found.")
+    else:
+        print(f"Kernel: {result['kernel']}")
+        print(f"Module signature enforcement: {result['module_signature_enforcement']}")
+        for device in result["devices"]:
+            assert isinstance(device, dict)
+            ids = " ".join(
+                f"{field}={device[key]}" for field, key in (("vendor", "vendor_id"), ("device", "device_id"))
+                if device[key] is not None
+            )
+            driver = device["driver"] or "none"
+            module = device["module"] or "built-in/unknown"
+            print(f"{device['name']}: {ids} driver={driver} module={module} status={device['status']}")
+        if _has_problem(result):
+            print("An unsupported or unbound driver needs investigation.", file=sys.stderr)
+
+    return 2 if _has_problem(result) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
