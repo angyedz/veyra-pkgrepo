@@ -429,25 +429,52 @@ def verify_project_mount_approvals(metadata: dict) -> None:
         raise VforgeError("project environment contains unapproved host mounts; review .vforge.toml with `vforge up`")
 
 
-def mount_in_namespace(source: str, target: str, *, readonly: bool = False) -> None:
+def mount_in_namespace(
+    source: str,
+    target: str,
+    *,
+    readonly: bool = False,
+    mountpoints: list[str] | None = None,
+) -> None:
     source_path = Path(source)
     if not source_path.is_absolute() or ".." in source_path.parts:
         raise VforgeError(f"mount source must be an absolute path without parent traversal: {source}")
-    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(source_path.anchor, flags)
+    path_flags = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
+    directory_flags = path_flags | os.O_DIRECTORY
+    descriptor = os.open(source_path.anchor, directory_flags)
     try:
-        for component in source_path.parts[1:]:
-            next_descriptor = os.open(component, flags | getattr(os, "O_NOFOLLOW", 0), dir_fd=descriptor)
+        components = source_path.parts[1:]
+        for index, component in enumerate(components):
+            final_component = index == len(components) - 1
+            component_flags = path_flags | getattr(os, "O_NOFOLLOW", 0)
+            if not final_component:
+                component_flags |= os.O_DIRECTORY
+            next_descriptor = os.open(component, component_flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+            if stat.S_ISLNK(os.fstat(descriptor).st_mode):
+                raise VforgeError(f"mount source may not traverse a symlink: {source}")
         pinned_source = f"/proc/self/fd/{descriptor}"
         run(["mount", "--bind", pinned_source, target])
+        if mountpoints is not None:
+            mountpoints.append(target)
         if readonly:
             run(["mount", "-o", "remount,bind,ro", target])
     except OSError as error:
         raise VforgeError(f"cannot safely open mount source {source}: {error}") from error
     finally:
         os.close(descriptor)
+
+
+def unmount_all(mountpoints: Sequence[str]) -> list[str]:
+    failed = []
+    for target in reversed(mountpoints):
+        result = run(["umount", "--", target], check=False)
+        if result.returncode:
+            result = run(["umount", "--lazy", "--", target], check=False)
+        if result.returncode:
+            failed.append(target)
+    return failed
 
 
 def veyra_root_marker(
@@ -553,69 +580,87 @@ def run_environment(path: Path, command: Sequence[str]) -> int:
         lower, merged = root / "lower", root / "merged"
         lower.mkdir()
         merged.mkdir()
-        run(["mount", "--make-rprivate", "/"])
-        run(["mount", "--bind", "/", str(lower)])
-        run(["mount", "-o", "remount,bind,ro", str(lower)])
-        options = f"lowerdir={lower},upperdir={metadata['upper']},workdir={metadata['work']}"
-        run(["mount", "-t", "overlay", "overlay", "-o", options, str(merged)])
-        if metadata.get("project"):
-            workspace = merged / "workspace"
-            workspace.mkdir(exist_ok=True)
-            mount_in_namespace(metadata["project"], str(workspace))
-            state_view = workspace / ".vforge"
-            state_view.mkdir(exist_ok=True)
-            run(["mount", "-t", "tmpfs", "-o", "mode=700,nosuid,nodev", "tmpfs", str(state_view)])
-        for item in metadata.get("mounts", []):
-            destination = merged / item["target"].lstrip("/")
-            current = merged
-            for component in PurePosixPath(item["target"]).parts[1:]:
-                current = current / component
-                if current.is_symlink():
-                    raise VforgeError(f"mount target traverses a symlink in the Veyra lower: {item['target']}")
-            destination.mkdir(parents=True, exist_ok=True)
-            mount_in_namespace(item["source"], str(destination), readonly=item["access"] == "read-only")
-        for name in ("proc", "sys", "dev", "tmp", "run", "home"):
-            (merged / name).mkdir(exist_ok=True)
-        run(["mount", "-t", "proc", "proc", str(merged / "proc")])
-        run(["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "sys")])
-        run(["mount", "-t", "tmpfs", "-o", "mode=755,nosuid", "tmpfs", str(merged / "dev")])
-        (merged / "dev" / "pts").mkdir()
-        (merged / "dev" / "shm").mkdir()
-        for device in ("null", "zero", "random", "urandom", "tty"):
-            (merged / "dev" / device).touch()
-            if Path("/dev", device).exists():
-                mount_in_namespace(f"/dev/{device}", str(merged / "dev" / device))
-        run(["mount", "-t", "devpts", "-o", "newinstance,nosuid,noexec,mode=0620,gid=0,ptmxmode=0666", "devpts", str(merged / "dev" / "pts")])
-        (merged / "dev" / "ptmx").symlink_to("pts/ptmx")
-        run(["mount", "-t", "tmpfs", "-o", "mode=1777,nosuid,nodev", "tmpfs", str(merged / "dev" / "shm")])
-        run(["mount", "-t", "tmpfs", "-o", "mode=1777,nosuid,nodev", "tmpfs", str(merged / "tmp")])
-        run(["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "run")])
-        run(["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "home")])
-        marker = veyra_root_marker(metadata, merged)
-        marker_directory = merged / "run/veyra-vforge"
-        marker_directory.mkdir(mode=0o755)
-        marker_file = marker_directory / "root.json"
-        marker_file.write_text(json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8")
-        marker_file.chmod(0o444)
-        run(["mount", "--bind", str(marker_file), str(marker_file)])
-        run(["mount", "-o", "remount,bind,ro", str(marker_file)])
-        child = os.fork()
-        if child == 0:
-            try:
-                os.chroot(merged)
-                ensure_vpkg_state(Path("/"))
-                os.chdir("/workspace" if metadata.get("project") else "/")
-                safe_environment = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-                for key, value in os.environ.items():
-                    if key == "TERM" or key == "LANG" or key.startswith("LC_"):
-                        safe_environment[key] = value
-                safe_environment["HOME"] = "/workspace" if metadata.get("project") else "/tmp"
-                os.execvpe(command[0], list(command), safe_environment)
-            except (OSError, VforgeError) as error:
-                print(f"vforge: cannot start command in environment: {error}", file=sys.stderr)
-                os._exit(127)
-        _, status = os.waitpid(child, 0)
-        return os.waitstatus_to_exitcode(status)
+        mountpoints: list[str] = []
+
+        def mount_at(target: Path, arguments: list[str]) -> None:
+            run(arguments)
+            mountpoints.append(str(target))
+
+        operation_error: BaseException | None = None
+        try:
+            run(["mount", "--make-rprivate", "/"])
+            mount_at(lower, ["mount", "--bind", "/", str(lower)])
+            run(["mount", "-o", "remount,bind,ro", str(lower)])
+            options = f"lowerdir={lower},upperdir={metadata['upper']},workdir={metadata['work']}"
+            mount_at(merged, ["mount", "-t", "overlay", "overlay", "-o", options, str(merged)])
+            if metadata.get("project"):
+                workspace = merged / "workspace"
+                workspace.mkdir(exist_ok=True)
+                mount_in_namespace(metadata["project"], str(workspace), mountpoints=mountpoints)
+                state_view = workspace / ".vforge"
+                state_view.mkdir(exist_ok=True)
+                mount_at(state_view, ["mount", "-t", "tmpfs", "-o", "mode=700,nosuid,nodev", "tmpfs", str(state_view)])
+            for item in metadata.get("mounts", []):
+                destination = merged / item["target"].lstrip("/")
+                current = merged
+                for component in PurePosixPath(item["target"]).parts[1:]:
+                    current = current / component
+                    if current.is_symlink():
+                        raise VforgeError(f"mount target traverses a symlink in the Veyra lower: {item['target']}")
+                destination.mkdir(parents=True, exist_ok=True)
+                mount_in_namespace(
+                    item["source"], str(destination),
+                    readonly=item["access"] == "read-only", mountpoints=mountpoints,
+                )
+            for name in ("proc", "sys", "dev", "tmp", "run", "home"):
+                (merged / name).mkdir(exist_ok=True)
+            mount_at(merged / "proc", ["mount", "-t", "proc", "proc", str(merged / "proc")])
+            mount_at(merged / "sys", ["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "sys")])
+            mount_at(merged / "dev", ["mount", "-t", "tmpfs", "-o", "mode=755,nosuid", "tmpfs", str(merged / "dev")])
+            (merged / "dev" / "pts").mkdir()
+            (merged / "dev" / "shm").mkdir()
+            for device in ("null", "zero", "random", "urandom", "tty"):
+                (merged / "dev" / device).touch()
+                if Path("/dev", device).exists():
+                    mount_in_namespace(f"/dev/{device}", str(merged / "dev" / device), mountpoints=mountpoints)
+            mount_at(merged / "dev/pts", ["mount", "-t", "devpts", "-o", "newinstance,nosuid,noexec,mode=0620,gid=0,ptmxmode=0666", "devpts", str(merged / "dev" / "pts")])
+            (merged / "dev" / "ptmx").symlink_to("pts/ptmx")
+            mount_at(merged / "dev/shm", ["mount", "-t", "tmpfs", "-o", "mode=1777,nosuid,nodev", "tmpfs", str(merged / "dev" / "shm")])
+            mount_at(merged / "tmp", ["mount", "-t", "tmpfs", "-o", "mode=1777,nosuid,nodev", "tmpfs", str(merged / "tmp")])
+            mount_at(merged / "run", ["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "run")])
+            mount_at(merged / "home", ["mount", "-t", "tmpfs", "-o", "mode=755,nosuid,nodev", "tmpfs", str(merged / "home")])
+            marker = veyra_root_marker(metadata, merged)
+            marker_directory = merged / "run/veyra-vforge"
+            marker_directory.mkdir(mode=0o755)
+            marker_file = marker_directory / "root.json"
+            marker_file.write_text(json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8")
+            marker_file.chmod(0o444)
+            mount_at(marker_file, ["mount", "--bind", str(marker_file), str(marker_file)])
+            run(["mount", "-o", "remount,bind,ro", str(marker_file)])
+            child = os.fork()
+            if child == 0:
+                try:
+                    os.chroot(merged)
+                    ensure_vpkg_state(Path("/"))
+                    os.chdir("/workspace" if metadata.get("project") else "/")
+                    safe_environment = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+                    for key, value in os.environ.items():
+                        if key == "TERM" or key == "LANG" or key.startswith("LC_"):
+                            safe_environment[key] = value
+                    safe_environment["HOME"] = "/workspace" if metadata.get("project") else "/tmp"
+                    os.execvpe(command[0], list(command), safe_environment)
+                except (OSError, VforgeError) as error:
+                    print(f"vforge: cannot start command in environment: {error}", file=sys.stderr)
+                    os._exit(127)
+            _, status = os.waitpid(child, 0)
+            return os.waitstatus_to_exitcode(status)
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            failures = unmount_all(mountpoints)
+            if failures and operation_error is None:
+                raise VforgeError("cannot unmount Vforge runtime mounts: " + ", ".join(failures))
     return 0
 
 
