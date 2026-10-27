@@ -15,6 +15,10 @@ on:
         type: choice
         options: [testing, main]
         default: testing
+      version:
+        description: Version X.Y.Z for a release (required only for manual publish)
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -38,7 +42,7 @@ jobs:
           ref: main
 
       - name: Install RPM repository tools
-        run: dnf -y install rpm-build rpm-sign createrepo_c gnupg2 dnf git findutils coreutils
+        run: dnf -y install rpm-build rpm-sign createrepo_c gnupg2 dnf git findutils coreutils squashfs-tools gh tar gzip
 
       - name: Resolve package channel
         id: channel
@@ -86,42 +90,80 @@ jobs:
           GNUPGHOME: ${{ runner.temp }}/veyra-rpm-gnupg
         run: bash scripts/build-rpm-repo.sh "$RUNNER_TEMP/veyra-repo/x86_64"
 
-      - name: Promote the tested RPMs into the main package channel
+      - name: Promote exactly the signed testing snapshot (never rebuild stable differently)
         if: steps.channel.outputs.name == 'main'
         env:
+          GH_TOKEN: ${{ github.token }}
           GNUPGHOME: ${{ runner.temp }}/veyra-rpm-gnupg
-        run: bash scripts/promote-rpm-channel.sh repo/testing/x86_64 "$RUNNER_TEMP/veyra-repo/x86_64"
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          mkdir -p "$RUNNER_TEMP/veyra-promotion" "$RUNNER_TEMP/veyra-repo"
+          gh release download "rpm-v$REQUESTED_VERSION-testing" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/veyra-promotion" \
+            --pattern 'veyra-rpm-repo-x86_64.tar.gz*'
+          (cd "$RUNNER_TEMP/veyra-promotion" && sha256sum -c veyra-rpm-repo-x86_64.tar.gz.sha256)
+          tar -xzf "$RUNNER_TEMP/veyra-promotion/veyra-rpm-repo-x86_64.tar.gz" -C "$RUNNER_TEMP/veyra-repo"
+          repo="$RUNNER_TEMP/veyra-repo/x86_64"
+          test -s "$repo/repodata/repomd.xml"
+          gpg --batch --verify "$repo/repodata/repomd.xml.asc" "$repo/repodata/repomd.xml"
+          cmp "$repo/RPM-GPG-KEY-VEYRA" <(gpg --batch --armor --export "$VEYRA_RPM_GPG_FINGERPRINT")
+
+      - name: Create release archive with expected vpkg x86_64 layout
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/veyra-repo/x86_64"
+          test -s "$repo/repodata/repomd.xml"
+          test -s "$repo/repodata/repomd.xml.asc"
+          test -s "$repo/RPM-GPG-KEY-VEYRA"
+          mkdir -p "$RUNNER_TEMP/veyra-release-assets"
+          (
+            cd "$RUNNER_TEMP/veyra-repo"
+            tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -czf "$RUNNER_TEMP/veyra-release-assets/veyra-rpm-repo-x86_64.tar.gz" x86_64
+          )
+          cd "$RUNNER_TEMP/veyra-release-assets"
+          asset=veyra-rpm-repo-x86_64.tar.gz
+          test "$(stat -c %s "$asset")" -le 2000000000 || {
+            echo "RPM asset exceeds 2 GB per GitHub Release." >&2; exit 1;
+          }
+          sha256sum "$asset" > "$asset.sha256"
+          sha256sum -c "$asset.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: veyra-${{ steps.channel.outputs.name }}-rpm-repository-${{ github.sha }}
-          path: ${{ runner.temp }}/veyra-repo/x86_64/
+          name: veyra-${{ steps.channel.outputs.name }}-rpm-release-assets-${{ github.sha }}
+          path: ${{ runner.temp }}/veyra-release-assets/
           retention-days: 14
           if-no-files-found: error
 
-      - name: Publish repository snapshot into the package channel directory
-        if: steps.signing.outputs.publish == 'true'
+      - name: Publish repository strictly from GitHub Releases
+        if: github.event_name == 'workflow_dispatch' && steps.signing.outputs.publish == 'true'
         env:
-          VEYRA_PACKAGE_CHANNEL: ${{ steps.channel.outputs.name }}
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.channel.outputs.name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          target="repo/$VEYRA_PACKAGE_CHANNEL/x86_64"
-          mkdir -p "$(dirname "$target")"
-          rm -rf "$target"
-          cp -a "$RUNNER_TEMP/veyra-repo/x86_64" "$target"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$target"
-          if git diff --cached --quiet; then
-            echo 'Repository snapshot is already current.' >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Release version must be X.Y.Z." >&2; exit 1;
+          }
+          tag="rpm-v$REQUESTED_VERSION"
+          extra=()
+          if [[ "$CHANNEL" == testing ]]; then tag="$tag-testing"; extra=(--prerelease); fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing signed release $tag" >&2; exit 1;
           fi
-          git commit -m "packages: publish Veyra ${VEYRA_PACKAGE_CHANNEL} RPM snapshot"
-          git push origin HEAD:main
+          cd "$RUNNER_TEMP/veyra-release-assets"
+          gh release create "$tag" \
+            veyra-rpm-repo-x86_64.tar.gz veyra-rpm-repo-x86_64.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Veyra RPM $REQUESTED_VERSION ($CHANNEL)" \
+            --notes "Signed Fedora 44 vpkg extension RPM snapshot from $GITHUB_SHA" \
+            "${extra[@]}"
 
-      - name: Explain skipped testing publication
+      - name: Note missing private signing key
         if: steps.signing.outputs.publish != 'true'
-        run: |
-          echo 'Signed testing-channel publication skipped: add VEYRA_RPM_GPG_PRIVATE_KEY_B64 as an Actions secret.' >> "$GITHUB_STEP_SUMMARY"
-          echo 'The workflow built and signed a temporary CI artifact only.' >> "$GITHUB_STEP_SUMMARY"
+        run: echo 'Release publication skipped: signing secret not configured; CI artifact only.' >> "$GITHUB_STEP_SUMMARY"
