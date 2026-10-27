@@ -105,6 +105,19 @@ jobs:
             --dir "$RUNNER_TEMP/veyra-promotion" \
             --pattern 'veyra-rpm-repo-x86_64.tar.gz*'
           (cd "$RUNNER_TEMP/veyra-promotion" && sha256sum -c veyra-rpm-repo-x86_64.tar.gz.sha256)
+          # The client only permits x86_64 regular-file/directory archives.
+          python3 - "$RUNNER_TEMP/veyra-promotion/veyra-rpm-repo-x86_64.tar.gz" <<'PY'
+          import sys, tarfile
+          from pathlib import PurePosixPath
+          with tarfile.open(sys.argv[1], "r:gz") as tar:
+              members = tar.getmembers()
+              if len(members) > 100000 or sum(x.size for x in members) > 1024**3:
+                  raise SystemExit("RPM snapshot exceeds vpkg archive safety limits")
+              for item in members:
+                  parts = PurePosixPath(item.name).parts
+                  if not parts or parts[0] != "x86_64" or ".." in parts or not (item.isfile() or item.isdir()):
+                      raise SystemExit("RPM snapshot contains an unsafe archive member")
+          PY
           tar -xzf "$RUNNER_TEMP/veyra-promotion/veyra-rpm-repo-x86_64.tar.gz" -C "$RUNNER_TEMP/veyra-repo"
           repo="$RUNNER_TEMP/veyra-repo/x86_64"
           test -s "$repo/repodata/repomd.xml"
@@ -126,8 +139,8 @@ jobs:
           )
           cd "$RUNNER_TEMP/veyra-release-assets"
           asset=veyra-rpm-repo-x86_64.tar.gz
-          test "$(stat -c %s "$asset")" -le 2000000000 || {
-            echo "RPM asset exceeds 2 GB per GitHub Release." >&2; exit 1;
+          test "$(stat -c %s "$asset")" -le 536870912 || {
+            echo "RPM asset exceeds the vpkg 512 MiB client cap (stricter than GitHub 2 GB)." >&2; exit 1;
           }
           sha256sum "$asset" > "$asset.sha256"
           sha256sum -c "$asset.sha256"
@@ -163,6 +176,29 @@ jobs:
             --title "Veyra RPM $REQUESTED_VERSION ($CHANNEL)" \
             --notes "Signed Fedora 44 vpkg extension RPM snapshot from $GITHUB_SHA" \
             "${extra[@]}"
+
+      - name: Verify downloaded GitHub Release snapshot matches signed metadata
+        if: github.event_name == 'workflow_dispatch' && steps.signing.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GNUPGHOME: ${{ runner.temp }}/veyra-rpm-gnupg
+          CHANNEL: ${{ steps.channel.outputs.name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tag="rpm-v$REQUESTED_VERSION"
+          [[ "$CHANNEL" == testing ]] && tag="$tag-testing"
+          mkdir -p "$RUNNER_TEMP/downloaded-rpm-release" "$RUNNER_TEMP/downloaded-rpm-repo"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'veyra-rpm-repo-x86_64.tar.gz*' \
+            --dir "$RUNNER_TEMP/downloaded-rpm-release"
+          cd "$RUNNER_TEMP/downloaded-rpm-release"
+          sha256sum -c veyra-rpm-repo-x86_64.tar.gz.sha256
+          tar -xzf veyra-rpm-repo-x86_64.tar.gz -C "$RUNNER_TEMP/downloaded-rpm-repo"
+          repo="$RUNNER_TEMP/downloaded-rpm-repo/x86_64"
+          gpg --batch --verify "$repo/repodata/repomd.xml.asc" "$repo/repodata/repomd.xml"
+          test -s "$repo"/veyra-*.rpm
+          echo "GitHub Releases downloaded RPM snapshot and pinned-signature roundtrip passed."
 
       - name: Note missing private signing key
         if: steps.signing.outputs.publish != 'true'
