@@ -53,6 +53,21 @@ for spec in "${specs[@]}"; do
   if [[ -d "$package_dir/SOURCES" ]]; then
     cp -a "$package_dir/SOURCES/." "$topdir/SOURCES/"
   fi
+  # vpkg intentionally rejects ordinary RPMs that write directly to /usr.
+  # Wrap optional Veyra payloads in a version-matched system extension.
+  if [[ "$package_name" == veyra-release ]]; then
+    command -v mksquashfs >/dev/null || {
+      echo "squashfs-tools is required for the signed vpkg extension" >&2; exit 1;
+    }
+    image_root="$topdir/image-root"
+    install -D -m 0644 "$topdir/SOURCES/release.txt" \
+      "$image_root/usr/share/veyra/release"
+    install -d "$image_root/usr/lib/extension-release.d"
+    printf 'ID=fedora\\nVERSION_ID=44\\nSYSEXT_LEVEL=1\\n' > \
+      "$image_root/usr/lib/extension-release.d/extension-release.veyra-release"
+    mksquashfs "$image_root" "$topdir/SOURCES/veyra-release.raw" \
+      -noappend -all-root -comp zstd -no-progress
+  fi
 
   rpmbuild -bb \
     --define "_topdir $topdir" \

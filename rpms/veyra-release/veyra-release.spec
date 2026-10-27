@@ -1,28 +1,21 @@
 Name:           veyra-release
 Version:        0.1.0
-Release:        1%{?dist}
-Summary:        Basic release information for Veyra Linux pre-alpha
+Release:        2%{?dist}
+Summary:        Fedora 44-compatible Veyra release system extension
 License:        MIT
-BuildArch:      noarch
-Source0:        release.txt
-Source1:        LICENSE
+BuildArch:      x86_64
+Source0:        veyra-release.raw
 
 %description
-Provides a small, human-readable release marker for Veyra Linux. It is a
-Veyra-specific add-on package and does not replace Fedora system packages.
+Signed optional system extension for the Veyra Next vpkg manager.
+The host EROFS base remains unchanged.
 
 %prep
 
 %build
 
 %install
-install -Dpm0644 %{SOURCE0} %{buildroot}%{_datadir}/veyra/release
-install -Dpm0644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
+install -D -m 0644 %{SOURCE0} %{buildroot}/var/lib/extensions/veyra-release.raw
 
 %files
-%license %{_licensedir}/%{name}/LICENSE
-%{_datadir}/veyra/release
-
-%changelog
-* Sun Oct 25 2026 Veyra contributors <packages@veyra.invalid> - 0.1.0-1
-- Add the first Veyra RPM repository smoke-test package.
+/var/lib/extensions/veyra-release.raw
